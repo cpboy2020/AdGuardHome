@@ -7,16 +7,19 @@ import flow from 'lodash/flow';
 
 import {
     renderInputField,
-    renderSelectField,
+    CheckboxField,
     renderRadioField,
     toNumber,
-    port,
-    portTLS,
-    isSafePort,
 } from '../../../helpers/form';
+import {
+    validateServerName, validateIsSafePort, validatePort, validatePortQuic, validatePortTLS,
+} from '../../../helpers/validators';
 import i18n from '../../../i18n';
 import KeyStatus from './KeyStatus';
 import CertificateStatus from './CertificateStatus';
+import {
+    DNS_OVER_QUIC_PORT, DNS_OVER_TLS_PORT, FORM_NAME, STANDARD_HTTPS_PORT, ENCRYPTION_SOURCE,
+} from '../../../helpers/constants';
 
 const validate = (values) => {
     const errors = {};
@@ -37,15 +40,18 @@ const clearFields = (change, setTlsConfig, t) => {
         certificate_chain: '',
         private_key_path: '',
         certificate_path: '',
-        port_https: 443,
-        port_dns_over_tls: 853,
+        port_https: STANDARD_HTTPS_PORT,
+        port_dns_over_tls: DNS_OVER_TLS_PORT,
+        port_dns_over_quic: DNS_OVER_QUIC_PORT,
         server_name: '',
         force_https: false,
         enabled: false,
+        private_key_saved: false,
     };
     // eslint-disable-next-line no-alert
     if (window.confirm(t('encryption_reset'))) {
-        Object.keys(fields).forEach((field) => change(field, fields[field]));
+        Object.keys(fields)
+            .forEach((field) => change(field, fields[field]));
         setTlsConfig(fields);
     }
 };
@@ -78,6 +84,7 @@ let Form = (props) => {
         setTlsConfig,
         certificateSource,
         privateKeySource,
+        privateKeySaved,
     } = props;
 
     const isSavingDisabled = invalid
@@ -96,7 +103,7 @@ let Form = (props) => {
                         <Field
                             name="enabled"
                             type="checkbox"
-                            component={renderSelectField}
+                            component={CheckboxField}
                             placeholder={t('encryption_enable')}
                             onChange={handleChange}
                         />
@@ -122,6 +129,7 @@ let Form = (props) => {
                             placeholder={t('encryption_server_enter')}
                             onChange={handleChange}
                             disabled={!isEnabled}
+                            validate={validateServerName}
                         />
                         <div className="form__desc">
                             <Trans>encryption_server_desc</Trans>
@@ -133,7 +141,7 @@ let Form = (props) => {
                         <Field
                             name="force_https"
                             type="checkbox"
-                            component={renderSelectField}
+                            component={CheckboxField}
                             placeholder={t('encryption_redirect')}
                             onChange={handleChange}
                             disabled={!isEnabled}
@@ -157,7 +165,7 @@ let Form = (props) => {
                             type="number"
                             className="form-control"
                             placeholder={t('encryption_https')}
-                            validate={[port, isSafePort]}
+                            validate={[validatePort, validateIsSafePort]}
                             normalize={toNumber}
                             onChange={handleChange}
                             disabled={!isEnabled}
@@ -179,13 +187,37 @@ let Form = (props) => {
                             type="number"
                             className="form-control"
                             placeholder={t('encryption_dot')}
-                            validate={[portTLS]}
+                            validate={[validatePortTLS]}
                             normalize={toNumber}
                             onChange={handleChange}
                             disabled={!isEnabled}
                         />
                         <div className="form__desc">
                             <Trans>encryption_dot_desc</Trans>
+                        </div>
+                    </div>
+                </div>
+                <div className="col-lg-6">
+                    <div className="form__group form__group--settings">
+                        <label className="form__label" htmlFor="port_dns_over_quic">
+                            <Trans>encryption_doq</Trans>
+                            &nbsp;
+                            <span className="text-lowercase">(<Trans>experimental</Trans>)</span>
+                        </label>
+                        <Field
+                                id="port_dns_over_quic"
+                                name="port_dns_over_quic"
+                                component={renderInputField}
+                                type="number"
+                                className="form-control"
+                                placeholder={t('encryption_doq')}
+                                validate={[validatePortQuic]}
+                                normalize={toNumber}
+                                onChange={handleChange}
+                                disabled={!isEnabled}
+                        />
+                        <div className="form__desc">
+                            <Trans>encryption_doq_desc</Trans>
                         </div>
                     </div>
                 </div>
@@ -203,7 +235,7 @@ let Form = (props) => {
                             <Trans
                                 values={{ link: 'letsencrypt.org' }}
                                 components={[
-                                    <a href="https://letsencrypt.org/" key="0">
+                                    <a target="_blank" rel="noopener noreferrer" href="https://letsencrypt.org/" key="0">
                                         link
                                     </a>,
                                 ]}
@@ -235,7 +267,7 @@ let Form = (props) => {
                             </div>
                         </div>
 
-                        {certificateSource === 'content' && (
+                        {certificateSource === ENCRYPTION_SOURCE.CONTENT && (
                             <Field
                                 id="certificate_chain"
                                 name="certificate_chain"
@@ -247,7 +279,7 @@ let Form = (props) => {
                                 disabled={!isEnabled}
                             />
                         )}
-                        {certificateSource === 'path' && (
+                        {certificateSource === ENCRYPTION_SOURCE.PATH && (
                             <Field
                                 id="certificate_path"
                                 name="certificate_path"
@@ -288,7 +320,7 @@ let Form = (props) => {
                                     component={renderRadioField}
                                     type="radio"
                                     className="form-control mr-2"
-                                    value="path"
+                                    value={ENCRYPTION_SOURCE.PATH}
                                     placeholder={t('encryption_key_source_path')}
                                     disabled={!isEnabled}
                                 />
@@ -297,28 +329,15 @@ let Form = (props) => {
                                     component={renderRadioField}
                                     type="radio"
                                     className="form-control mr-2"
-                                    value="content"
+                                    value={ENCRYPTION_SOURCE.CONTENT}
                                     placeholder={t('encryption_key_source_content')}
                                     disabled={!isEnabled}
                                 />
                             </div>
                         </div>
 
-                        {privateKeySource === 'content' && (
+                        {privateKeySource === ENCRYPTION_SOURCE.PATH && (
                             <Field
-                                id="private_key"
-                                name="private_key"
-                                component="textarea"
-                                type="text"
-                                className="form-control form-control--textarea"
-                                placeholder={t('encryption_key_input')}
-                                onChange={handleChange}
-                                disabled={!isEnabled}
-                            />
-                        )}
-                        {privateKeySource === 'path' && (
-                            <Field
-                                id="private_key_path"
                                 name="private_key_path"
                                 component={renderInputField}
                                 type="text"
@@ -328,6 +347,36 @@ let Form = (props) => {
                                 disabled={!isEnabled}
                             />
                         )}
+                        {privateKeySource === ENCRYPTION_SOURCE.CONTENT && [
+                            <Field
+                                key="private_key_saved"
+                                name="private_key_saved"
+                                type="checkbox"
+                                className="form__group form__group--settings mb-2"
+                                component={CheckboxField}
+                                disabled={!isEnabled}
+                                placeholder={t('use_saved_key')}
+                                onChange={(event) => {
+                                    if (event.target.checked) {
+                                        change('private_key', '');
+                                    }
+                                    if (handleChange) {
+                                        handleChange(event);
+                                    }
+                                }}
+                            />,
+                            <Field
+                                id="private_key"
+                                key="private_key"
+                                name="private_key"
+                                component="textarea"
+                                type="text"
+                                className="form-control form-control--textarea"
+                                placeholder={t('encryption_key_input')}
+                                onChange={handleChange}
+                                disabled={!isEnabled || privateKeySaved}
+                            />,
+                        ]}
                     </div>
                     <div className="form__status">
                         {(privateKey || privateKeyPath) && (
@@ -384,7 +433,7 @@ Form.propTypes = {
     valid_key: PropTypes.bool,
     valid_cert: PropTypes.bool,
     valid_pair: PropTypes.bool,
-    dns_names: PropTypes.string,
+    dns_names: PropTypes.arrayOf(PropTypes.string),
     key_type: PropTypes.string,
     issuer: PropTypes.string,
     subject: PropTypes.string,
@@ -392,9 +441,10 @@ Form.propTypes = {
     setTlsConfig: PropTypes.func.isRequired,
     certificateSource: PropTypes.string,
     privateKeySource: PropTypes.string,
+    privateKeySaved: PropTypes.bool,
 };
 
-const selector = formValueSelector('encryptionForm');
+const selector = formValueSelector(FORM_NAME.ENCRYPTION);
 
 Form = connect((state) => {
     const isEnabled = selector(state, 'enabled');
@@ -404,6 +454,7 @@ Form = connect((state) => {
     const privateKeyPath = selector(state, 'private_key_path');
     const certificateSource = selector(state, 'certificate_source');
     const privateKeySource = selector(state, 'key_source');
+    const privateKeySaved = selector(state, 'private_key_saved');
     return {
         isEnabled,
         certificateChain,
@@ -412,13 +463,14 @@ Form = connect((state) => {
         privateKeyPath,
         certificateSource,
         privateKeySource,
+        privateKeySaved,
     };
 })(Form);
 
 export default flow([
     withTranslation(),
     reduxForm({
-        form: 'encryptionForm',
+        form: FORM_NAME.ENCRYPTION,
         validate,
     }),
 ])(Form);

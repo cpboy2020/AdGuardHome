@@ -6,6 +6,7 @@ import { Trans, withTranslation } from 'react-i18next';
 import flow from 'lodash/flow';
 
 import Controls from './Controls';
+import { FORM_NAME } from '../../helpers/constants';
 
 let Submit = (props) => (
     <div className="setup__step">
@@ -46,11 +47,10 @@ Submit = connect((state) => {
     };
 })(Submit);
 
-
 export default flow([
     withTranslation(),
     reduxForm({
-        form: 'install',
+        form: FORM_NAME.INSTALL,
         destroyOnUnmount: false,
         forceUnregisterOnUnmount: true,
     }),

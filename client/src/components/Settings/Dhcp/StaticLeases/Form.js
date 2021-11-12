@@ -1,23 +1,34 @@
 import React from 'react';
 import PropTypes from 'prop-types';
 import { Field, reduxForm } from 'redux-form';
-import { Trans, withTranslation } from 'react-i18next';
-import flow from 'lodash/flow';
+import { Trans, useTranslation } from 'react-i18next';
+import { useDispatch } from 'react-redux';
 
+import { renderInputField, normalizeMac } from '../../../../helpers/form';
 import {
-    renderInputField, ipv4, mac, required,
-} from '../../../../helpers/form';
+    validateIpv4,
+    validateMac,
+    validateRequiredValue,
+    validateIpv4InCidr,
+} from '../../../../helpers/validators';
+import { FORM_NAME } from '../../../../helpers/constants';
+import { toggleLeaseModal } from '../../../../actions';
 
-const Form = (props) => {
-    const {
-        t,
-        handleSubmit,
-        reset,
-        pristine,
-        submitting,
-        toggleLeaseModal,
-        processingAdding,
-    } = props;
+const Form = ({
+    handleSubmit,
+    reset,
+    pristine,
+    submitting,
+    processingAdding,
+    cidr,
+}) => {
+    const { t } = useTranslation();
+    const dispatch = useDispatch();
+
+    const onClick = () => {
+        reset();
+        dispatch(toggleLeaseModal());
+    };
 
     return (
         <form onSubmit={handleSubmit}>
@@ -30,7 +41,8 @@ const Form = (props) => {
                         type="text"
                         className="form-control"
                         placeholder={t('form_enter_mac')}
-                        validate={[required, mac]}
+                        normalize={normalizeMac}
+                        validate={[validateRequiredValue, validateMac]}
                     />
                 </div>
                 <div className="form__group">
@@ -40,8 +52,12 @@ const Form = (props) => {
                         component={renderInputField}
                         type="text"
                         className="form-control"
-                        placeholder={t('form_enter_ip')}
-                        validate={[required, ipv4]}
+                        placeholder={t('form_enter_subnet_ip', { cidr })}
+                        validate={[
+                            validateRequiredValue,
+                            validateIpv4,
+                            validateIpv4InCidr,
+                        ]}
                     />
                 </div>
                 <div className="form__group">
@@ -62,10 +78,7 @@ const Form = (props) => {
                         type="button"
                         className="btn btn-secondary btn-standard"
                         disabled={submitting}
-                        onClick={() => {
-                            reset();
-                            toggleLeaseModal();
-                        }}
+                        onClick={onClick}
                     >
                         <Trans>cancel_btn</Trans>
                     </button>
@@ -83,16 +96,18 @@ const Form = (props) => {
 };
 
 Form.propTypes = {
+    initialValues: PropTypes.shape({
+        mac: PropTypes.string.isRequired,
+        ip: PropTypes.string.isRequired,
+        hostname: PropTypes.string.isRequired,
+        cidr: PropTypes.string.isRequired,
+    }),
     pristine: PropTypes.bool.isRequired,
     handleSubmit: PropTypes.func.isRequired,
     reset: PropTypes.func.isRequired,
     submitting: PropTypes.bool.isRequired,
-    toggleLeaseModal: PropTypes.func.isRequired,
     processingAdding: PropTypes.bool.isRequired,
-    t: PropTypes.func.isRequired,
+    cidr: PropTypes.string.isRequired,
 };
 
-export default flow([
-    withTranslation(),
-    reduxForm({ form: 'leaseForm' }),
-])(Form);
+export default reduxForm({ form: FORM_NAME.LEASE })(Form);

@@ -1,13 +1,17 @@
-import React, { Component, Fragment } from 'react';
+import React, { Component } from 'react';
 import PropTypes from 'prop-types';
 import { Trans, withTranslation } from 'react-i18next';
-
 import Card from '../ui/Card';
 import PageTitle from '../ui/PageTitle';
 import Examples from './Examples';
 import Check from './Check';
+import { getTextareaCommentsHighlight, syncScroll } from '../../helpers/highlightTextareaComments';
+import { COMMENT_LINE_DEFAULT_TOKEN } from '../../helpers/constants';
+import '../ui/texareaCommentsHighlight.css';
 
 class CustomRules extends Component {
+    ref = React.createRef();
+
     componentDidMount() {
         this.props.getFilteringStatus();
     }
@@ -34,30 +38,35 @@ class CustomRules extends Component {
         this.props.checkHost(values);
     };
 
+    onScroll = (e) => syncScroll(e, this.ref)
+
     render() {
         const {
             t,
             filtering: {
-                filters,
-                whitelistFilters,
                 userRules,
-                processingCheck,
-                check,
             },
         } = this.props;
 
         return (
-            <Fragment>
+            <>
                 <PageTitle title={t('custom_filtering_rules')} />
-                <Card
-                    subtitle={t('custom_filter_rules_hint')}
-                >
+                <Card subtitle={t('custom_filter_rules_hint')}>
                     <form onSubmit={this.handleSubmit}>
-                        <textarea
-                            className="form-control form-control--textarea-large font-monospace"
-                            value={userRules}
-                            onChange={this.handleChange}
-                        />
+                        <div className="text-edit-container mb-4">
+                            <textarea
+                                className="form-control font-monospace text-input"
+                                value={userRules}
+                                onChange={this.handleChange}
+                                onScroll={this.onScroll}
+                            />
+                            {getTextareaCommentsHighlight(
+                                this.ref,
+                                userRules,
+                                undefined,
+                                [COMMENT_LINE_DEFAULT_TOKEN, '!'],
+                            )}
+                        </div>
                         <div className="card-actions">
                             <button
                                 className="btn btn-success btn-standard btn-large"
@@ -71,14 +80,8 @@ class CustomRules extends Component {
                     <hr />
                     <Examples />
                 </Card>
-                <Check
-                    filters={filters}
-                    whitelistFilters={whitelistFilters}
-                    check={check}
-                    onSubmit={this.handleCheck}
-                    processing={processingCheck}
-                />
-            </Fragment>
+                <Check onSubmit={this.handleCheck} />
+            </>
         );
     }
 }

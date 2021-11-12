@@ -14,9 +14,9 @@ const access = handleActions(
             } = payload;
             const newState = {
                 ...state,
-                allowed_clients: (allowed_clients && allowed_clients.join('\n')) || '',
-                disallowed_clients: (disallowed_clients && disallowed_clients.join('\n')) || '',
-                blocked_hosts: (blocked_hosts && blocked_hosts.join('\n')) || '',
+                allowed_clients: allowed_clients?.join('\n') || '',
+                disallowed_clients: disallowed_clients?.join('\n') || '',
+                blocked_hosts: blocked_hosts?.join('\n') || '',
                 processing: false,
             };
             return newState;
@@ -24,13 +24,7 @@ const access = handleActions(
 
         [actions.setAccessListRequest]: (state) => ({ ...state, processingSet: true }),
         [actions.setAccessListFailure]: (state) => ({ ...state, processingSet: false }),
-        [actions.setAccessListSuccess]: (state) => {
-            const newState = {
-                ...state,
-                processingSet: false,
-            };
-            return newState;
-        },
+        [actions.setAccessListSuccess]: (state) => ({ ...state, processingSet: false }),
 
         [actions.toggleClientBlockRequest]: (state) => ({ ...state, processingSet: true }),
         [actions.toggleClientBlockFailure]: (state) => ({ ...state, processingSet: false }),
@@ -42,9 +36,9 @@ const access = handleActions(
             } = payload;
             const newState = {
                 ...state,
-                allowed_clients: (allowed_clients && allowed_clients.join('\n')) || '',
-                disallowed_clients: (disallowed_clients && disallowed_clients.join('\n')) || '',
-                blocked_hosts: (blocked_hosts && blocked_hosts.join('\n')) || '',
+                allowed_clients: allowed_clients?.join('\n') || '',
+                disallowed_clients: disallowed_clients?.join('\n') || '',
+                blocked_hosts: blocked_hosts?.join('\n') || '',
                 processingSet: false,
             };
             return newState;

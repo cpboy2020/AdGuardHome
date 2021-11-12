@@ -29,7 +29,7 @@ function writeInFile(filename, body) {
     return new Promise((resolve, reject) => {
         if (typeof normalizedBody !== 'string') {
             try {
-                normalizedBody = JSON.stringify(normalizedBody, null, 4); // eslint-disable-line
+                normalizedBody = JSON.stringify(normalizedBody, null, 4) + '\n'; // eslint-disable-line
             } catch (err) {
                 reject(err);
             }
@@ -81,9 +81,17 @@ const request = (url, locale) => (
         }));
 
 /**
+ * Sleep.
+ * @param {number} ms
+ */
+const sleep = (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms);
+});
+
+/**
  * Download locales
  */
-const download = () => {
+const download = async () => {
     const locales = LOCALES_LIST;
 
     if (!TWOSKY_URI) {
@@ -91,10 +99,16 @@ const download = () => {
         return;
     }
 
-    const requests = locales.map((locale) => {
+    const requests = [];
+    for (let i = 0; i < locales.length; i++) {
+        const locale = locales[i];
         const url = getRequestUrl(locale, TWOSKY_URI, TWOSKY_PROJECT_ID);
-        return request(url, locale);
-    });
+        requests.push(request(url, locale));
+
+        // Don't request the Crowdin API too aggressively to prevent spurious
+        // 400 errors.
+        await sleep(200);
+    }
 
     Promise
         .all(requests)
