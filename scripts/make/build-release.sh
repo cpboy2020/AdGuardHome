@@ -7,21 +7,17 @@
 # Experienced readers may find it overly verbose.
 
 # The default verbosity level is 0.  Show log messages if the caller requested
-# verbosity level greather than 0.  Show every command that is run if the
-# verbosity level is greater than 1.  Show the environment if the verbosity
-# level is greater than 2.  Otherwise, print nothing.
+# verbosity level greater than 0.  Show the environment and every command that
+# is run if the verbosity level is greater than 1.  Otherwise, print nothing.
 #
 # The level of verbosity for the build script is the same minus one level.  See
 # below in build().
 verbose="${VERBOSE:-0}"
 readonly verbose
 
-if [ "$verbose" -gt '2' ]
+if [ "$verbose" -gt '1' ]
 then
 	env
-	set -x
-elif [ "$verbose" -gt '1' ]
-then
 	set -x
 fi
 
@@ -109,17 +105,17 @@ log "checking tools"
 
 # Make sure we fail gracefully if one of the tools we need is missing.  Use
 # alternatives when available.
-sha256sum_cmd='sha256sum'
-for tool in gpg gzip sed "$sha256sum_cmd" snapcraft tar zip
+use_shasum='0'
+for tool in gpg gzip sed sha256sum snapcraft tar zip
 do
 	if ! command -v "$tool" > /dev/null
 	then
-		if [ "$tool" = "$sha256sum_cmd" ] && command -v 'shasum' > /dev/null
+		if [ "$tool" = 'sha256sum' ] && command -v 'shasum' > /dev/null
 		then
-			# macOS doesn't have sha256sum installed by default, but
-			# it does have shasum.
+			# macOS doesn't have sha256sum installed by default, but it does
+			# have shasum.
 			log 'replacing sha256sum with shasum -a 256'
-			sha256sum_cmd='shasum -a 256'
+			use_shasum='1'
 		else
 			log "pieces don't fit, '$tool' not found"
 
@@ -127,39 +123,37 @@ do
 		fi
 	fi
 done
-readonly sha256sum_cmd
+readonly use_shasum
 
 # Data section.  Arrange data into space-separated tables for read -r to read.
-# Use 0 for missing values.
-#
-# TODO(a.garipov): Remove armv6, because it was always overwritten by armv7.
-# Rename armv7 to armhf.  Rename the 386 snap to i386.
+# Use a hyphen for missing values.
 
 #    os  arch      arm mips       snap
 platforms="\
-darwin   amd64     0   0          0
-darwin   arm64     0   0          0
-freebsd  386       0   0          0
-freebsd  amd64     0   0          0
-freebsd  arm       5   0          0
-freebsd  arm       6   0          0
-freebsd  arm       7   0          0
-freebsd  arm64     0   0          0
-linux    386       0   0          386
-linux    amd64     0   0          amd64
-linux    arm       5   0          0
-linux    arm       6   0          armv6
-linux    arm       7   0          armv7
-linux    arm64     0   0          arm64
-linux    mips      0   softfloat  0
-linux    mips64    0   softfloat  0
-linux    mips64le  0   softfloat  0
-linux    mipsle    0   softfloat  0
-linux    ppc64le   0   0          0
-openbsd  amd64     0   0          0
-openbsd  arm64     0   0          0
-windows  386       0   0          0
-windows  amd64     0   0          0"
+darwin   amd64     -   -          -
+darwin   arm64     -   -          -
+freebsd  386       -   -          -
+freebsd  amd64     -   -          -
+freebsd  arm       5   -          -
+freebsd  arm       6   -          -
+freebsd  arm       7   -          -
+freebsd  arm64     -   -          -
+linux    386       -   -          i386
+linux    amd64     -   -          amd64
+linux    arm       5   -          -
+linux    arm       6   -          -
+linux    arm       7   -          armhf
+linux    arm64     -   -          arm64
+linux    mips      -   softfloat  -
+linux    mips64    -   softfloat  -
+linux    mips64le  -   softfloat  -
+linux    mipsle    -   softfloat  -
+linux    ppc64le   -   -          -
+openbsd  amd64     -   -          -
+openbsd  arm64     -   -          -
+windows  386       -   -          -
+windows  amd64     -   -          -
+windows  arm64     -   -          -"
 readonly platforms
 
 # Function build builds the release for one platform.  It builds a binary, an
@@ -188,15 +182,12 @@ build() {
 
 	# Build the binary.
 	#
-	# Set GOARM and GOMIPS to an empty string if $build_arm and $build_mips
-	# are zero by removing the zero as if it's a prefix.
-	#
-	# Don't use quotes with $build_par because we want an empty space if
-	# parallelism wasn't set.
+	# Set GOARM and GOMIPS to an empty string if $build_arm and $build_mips are
+	# the zero value by removing the hyphen as if it's a prefix.
 	env\
 		GOARCH="$build_arch"\
-		GOARM="${build_arm#0}"\
-		GOMIPS="${build_mips#0}"\
+		GOARM="${build_arm#-}"\
+		GOMIPS="${build_mips#-}"\
 		GOOS="$os"\
 		VERBOSE="$(( verbose - 1 ))"\
 		VERSION="$version"\
@@ -227,8 +218,8 @@ build() {
 	in
 	('darwin'|'windows')
 		build_archive="./${dist}/${build_ar}.zip"
-		# TODO(a.garipov): Find an option similar to the -C option of
-		# tar for zip.
+		# TODO(a.garipov): Find an option similar to the -C option of tar for
+		# zip.
 		( cd "${dist}/${1}" && zip -9 -q -r "../../${build_archive}" "./AdGuardHome" )
 		;;
 	(*)
@@ -239,58 +230,38 @@ build() {
 
 	log "$build_archive"
 
-	# build_snap is a string, so use string comparison for it.
-	#
-	# TODO(a.garipov): Consider using a different empty value in the
-	# platforms table.
-	if [ "$build_snap" = '0' ] || [ "$snap_enabled" -eq '0' ]
+	# Exit if we don't need to build the Snap package.
+	if [ "$build_snap" = '-' ] || [ "$snap_enabled" -eq '0' ]
 	then
 		return
 	fi
 
-	# Prepare snap build.
+	# Prepare the Snap build.
 	build_snap_output="./${dist}/AdGuardHome_${build_snap}.snap"
 	build_snap_dir="${build_snap_output}.dir"
 
 	# Create the meta subdirectory and copy files there.
 	mkdir -p "${build_snap_dir}/meta"
-	cp "$build_output"\
-		'./scripts/snap/local/adguard-home-web.sh'\
-		"$build_snap_dir"
-	cp -r './scripts/snap/gui'\
-		"${build_snap_dir}/meta/"
-
-	# TODO(a.garipov): Remove this crutch later.
-	case "$build_snap"
-	in
-	('386')
-		build_snap_arch="i386"
-		;;
-	('armv6'|'armv7')
-		build_snap_arch="armhf"
-		;;
-	(*)
-		build_snap_arch="$build_snap"
-		;;
-	esac
+	cp "$build_output" './scripts/snap/local/adguard-home-web.sh' "$build_snap_dir"
+	cp -r './scripts/snap/gui' "${build_snap_dir}/meta/"
 
 	# Create a snap.yaml file, setting the values.
 	sed -e 's/%VERSION%/'"$version"'/'\
-		-e 's/%ARCH%/'"$build_snap_arch"'/'\
+		-e 's/%ARCH%/'"$build_snap"'/'\
 		./scripts/snap/snap.tmpl.yaml\
 		>"${build_snap_dir}/meta/snap.yaml"
 
 	# TODO(a.garipov): The snapcraft tool will *always* write everything,
-	# including errors, to stdout.  And there doesn't seem to be a way to
-	# change that.  So, save the combined output, but only show it when
-	# snapcraft actually fails.
+	# including errors, to stdout.  And there doesn't seem to be a way to change
+	# that.  So, save the combined output, but only show it when snapcraft
+	# actually fails.
 	set +e
 	build_snapcraft_output="$(
 		snapcraft pack "$build_snap_dir" --output "$build_snap_output" 2>&1
 	)"
 	build_snapcraft_exit_code="$?"
 	set -e
-	if [ "$build_snapcraft_exit_code" != '0' ]
+	if [ "$build_snapcraft_exit_code" -ne '0' ]
 	then
 		log "$build_snapcraft_output"
 		exit "$build_snapcraft_exit_code"
@@ -349,47 +320,84 @@ done
 log "packing frontend"
 
 build_archive="./${dist}/AdGuardHome_frontend.tar.gz"
-tar -c -f - ./build ./build2 | gzip -9 - > "$build_archive"
+tar -c -f - ./build | gzip -9 - > "$build_archive"
 log "$build_archive"
 
 log "calculating checksums"
 
+# calculate_checksums uses the previously detected SHA-256 tool to calculate
+# checksums.  Do not use find with -exec, since shasum requires arguments.
+calculate_checksums() {
+	if [ "$use_shasum" -eq '0' ]
+	then
+		sha256sum "$@"
+	else
+		shasum -a 256 "$@"
+	fi
+}
+
 # Calculate the checksums of the files in a subshell with a different working
 # directory.  Don't use ls, because files matching one of the patterns may be
 # absent, which will make ls return with a non-zero status code.
+#
+# TODO(a.garipov): Consider calculating these as the build goes.
 (
+	set +f
+
 	cd "./${dist}"
 
-	find . ! -name . -prune \( -name '*.tar.gz' -o -name '*.zip' \)\
-		-exec "$sha256sum_cmd" {} +\
-		> ./checksums.txt
+	: > ./checksums.txt
+
+	for archive in ./*.zip ./*.tar.gz
+	do
+		# Make sure that we don't try to calculate a checksum for a glob pattern
+		# that matched no files.
+		if [ ! -f "$archive" ]
+		then
+			continue
+		fi
+
+		calculate_checksums "$archive" >> ./checksums.txt
+	done
 )
 
 log "writing versions"
 
 echo "version=$version" > "./${dist}/version.txt"
 
-# Create the verison.json file.
+# Create the version.json file.
 
-version_download_url="https://static.adguard.com/adguardhome/${channel}"
+version_download_url="https://static.adtidy.org/adguardhome/${channel}"
 version_json="./${dist}/version.json"
 readonly version_download_url version_json
 
-# Point users to the master branch if the channel is edge.
+# If the channel is edge, point users to the "Platforms" page on the Wiki,
+# because the direct links to the edge packages are listed there.
 if [ "$channel" = 'edge' ]
 then
-	version_history_url='https://github.com/AdguardTeam/AdGuardHome/commits/master'
+	announcement_url='https://github.com/AdguardTeam/AdGuardHome/wiki/Platforms'
 else
-	version_history_url='https://github.com/AdguardTeam/AdGuardHome/releases'
+	announcement_url="https://github.com/AdguardTeam/AdGuardHome/releases/tag/${version}"
 fi
-readonly version_history_url
+readonly announcement_url
 
+# TODO(a.garipov): Remove "selfupdate_min_version" in future versions.
 rm -f "$version_json"
 echo "{
   \"version\": \"${version}\",
   \"announcement\": \"AdGuard Home ${version} is now available!\",
-  \"announcement_url\": \"${version_history_url}\",
+  \"announcement_url\": \"${announcement_url}\",
   \"selfupdate_min_version\": \"0.0\",
+" >> "$version_json"
+
+# Add the MIPS* object keys without the "softfloat" part to mitigate the
+# consequences of #5373.
+#
+# TODO(a.garipov): Remove this around fall 2023.
+echo "
+  \"download_linux_mips64\": \"${version_download_url}/AdGuardHome_linux_mips64_softfloat.tar.gz\",
+  \"download_linux_mips64le\": \"${version_download_url}/AdGuardHome_linux_mips64le_softfloat.tar.gz\",
+  \"download_linux_mipsle\": \"${version_download_url}/AdGuardHome_linux_mipsle_softfloat.tar.gz\",
 " >> "$version_json"
 
 # Same as with checksums above, don't use ls, because files matching one of the

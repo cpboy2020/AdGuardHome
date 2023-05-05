@@ -52,6 +52,7 @@ const Row = memo(({
     const autoClients = useSelector((state) => state.dashboard.autoClients, shallowEqual);
     const processingSet = useSelector((state) => state.access.processingSet);
     const allowedСlients = useSelector((state) => state.access.allowed_clients, shallowEqual);
+    const services = useSelector((store) => store?.services);
 
     const clients = useSelector((state) => state.dashboard.clients);
 
@@ -76,6 +77,7 @@ const Row = memo(({
             originalResponse,
             status,
             service_name,
+            cached,
         } = rowProps;
 
         const hasTracker = !!tracker;
@@ -116,6 +118,9 @@ const Row = memo(({
 
         const blockingForClientKey = isFiltered ? 'unblock_for_this_client_only' : 'block_for_this_client_only';
         const clientNameBlockingFor = getBlockingClientName(clients, client);
+        const upstreamString = cached
+            ? t('served_from_cache', { value: upstream, i: <i /> })
+            : upstream;
 
         const onBlockingForClientClick = () => {
             dispatch(toggleBlockingForClient(buttonType, domain, clientNameBlockingFor));
@@ -135,20 +140,32 @@ const Row = memo(({
             }
         };
 
-        const blockButton = <button
-                className={classNames('title--border text-center button-action--arrow-option', { 'bg--danger': !isBlocked })}
-                onClick={onToggleBlock}>
-            {t(buttonType)}
-        </button>;
+        const blockButton = (
+            <>
+                <div className="title--border" />
+                <button
+                    type="button"
+                    className={
+                        classNames(
+                            'button-action--arrow-option mb-1',
+                            { 'bg--danger': !isBlocked },
+                            { 'bg--green': isFiltered },
+                        )}
+                    onClick={onToggleBlock}
+                >
+                    {t(buttonType)}
+                </button>
+            </>
+        );
 
         const blockForClientButton = <button
-                className='text-center font-weight-bold py-2 button-action--arrow-option'
+                className='text-center font-weight-bold py-1 button-action--arrow-option'
                 onClick={onBlockingForClientClick}>
             {t(blockingForClientKey)}
         </button>;
 
         const blockClientButton = <button
-                className='text-center font-weight-bold py-2 button-action--arrow-option'
+                className='text-center font-weight-bold py-1 button-action--arrow-option'
                 onClick={onBlockingClientClick}
                 disabled={processingSet || lastRuleInAllowlist}>
             {t(blockingClientKey)}
@@ -159,8 +176,8 @@ const Row = memo(({
             date: formatDateTime(time, DEFAULT_SHORT_DATE_FORMAT_OPTIONS),
             encryption_status: isBlocked
                 ? <div className="bg--danger">{requestStatus}</div> : requestStatus,
-            ...(FILTERED_STATUS.FILTERED_BLOCKED_SERVICE && service_name
-                && { service_name: getServiceName(service_name) }),
+            ...(FILTERED_STATUS.FILTERED_BLOCKED_SERVICE && service_name && services.allServices
+                && { service_name: getServiceName(services.allServices, service_name) }),
             domain,
             type_table_header: type,
             protocol,
@@ -175,7 +192,7 @@ const Row = memo(({
                             className="link--green">{sourceData.name}
                     </a>,
             response_details: 'title',
-            install_settings_dns: upstream,
+            install_settings_dns: upstreamString,
             elapsed: formattedElapsedMs,
             ...(rules.length > 0
                     && { rule_label: getRulesToFilterList(rules, filters, whitelistFilters) }
@@ -230,9 +247,11 @@ Row.propTypes = {
         time: propTypes.string.isRequired,
         tracker: propTypes.object,
         upstream: propTypes.string.isRequired,
+        cached: propTypes.bool.isRequired,
         type: propTypes.string.isRequired,
         client_proto: propTypes.string.isRequired,
         client_id: propTypes.string,
+        ecs: propTypes.string,
         client_info: propTypes.shape({
             name: propTypes.string.isRequired,
             whois: propTypes.shape({

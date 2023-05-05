@@ -20,8 +20,13 @@ import EncryptionTopline from '../ui/EncryptionTopline';
 import Icons from '../ui/Icons';
 import i18n from '../../i18n';
 import Loading from '../ui/Loading';
-import { FILTERS_URLS, MENU_URLS, SETTINGS_URLS } from '../../helpers/constants';
-import { getLogsUrlParams, setHtmlLangAttr } from '../../helpers/helpers';
+import {
+    FILTERS_URLS,
+    MENU_URLS,
+    SETTINGS_URLS,
+    THEMES,
+} from '../../helpers/constants';
+import { getLogsUrlParams, setHtmlLangAttr, setUITheme } from '../../helpers/helpers';
 import Header from '../Header';
 import { changeLanguage, getDnsStatus } from '../../actions';
 
@@ -38,6 +43,7 @@ import DnsRewrites from '../../containers/DnsRewrites';
 import CustomRules from '../../containers/CustomRules';
 import Services from '../Filters/Services';
 import Logs from '../Logs';
+import ProtectionTimer from '../ProtectionTimer';
 
 const ROUTES = [
     {
@@ -109,6 +115,7 @@ const App = () => {
         isCoreRunning,
         isUpdateAvailable,
         processing,
+        theme,
     } = useSelector((state) => state.dashboard, shallowEqual);
 
     const { processing: processingEncryption } = useSelector((
@@ -138,6 +145,40 @@ const App = () => {
         setLanguage();
     }, [language]);
 
+    const handleAutoTheme = (e, accountTheme) => {
+        if (accountTheme !== THEMES.auto) {
+            return;
+        }
+
+        if (e.matches) {
+            setUITheme(THEMES.dark);
+        } else {
+            setUITheme(THEMES.light);
+        }
+    };
+
+    useEffect(() => {
+        if (theme !== THEMES.auto) {
+            setUITheme(theme);
+
+            return;
+        }
+
+        const colorSchemeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+        setUITheme(theme);
+
+        if (colorSchemeMedia.addEventListener !== undefined) {
+            colorSchemeMedia.addEventListener('change', (e) => {
+                handleAutoTheme(e, theme);
+            });
+        } else {
+            // Deprecated addListener for older versions of Safari.
+            colorSchemeMedia.addListener((e) => {
+                handleAutoTheme(e, theme);
+            });
+        }
+    }, [theme]);
+
     const reloadPage = () => {
         window.location.reload();
     };
@@ -150,6 +191,7 @@ const App = () => {
         {!processingEncryption && <EncryptionTopline />}
         <LoadingBar className="loading-bar" updateTime={1000} />
         <Header />
+        <ProtectionTimer />
         <div className="container container--wrap pb-5">
             {processing && <Loading />}
             {!isCoreRunning && <div className="row row-cards">

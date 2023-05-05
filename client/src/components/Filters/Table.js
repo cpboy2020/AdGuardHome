@@ -36,17 +36,18 @@ class Table extends Component {
             Cell: this.renderCheckbox,
             width: 90,
             className: 'text-center',
+            resizable: false,
         },
         {
             Header: <Trans>name_table_header</Trans>,
             accessor: 'name',
-            minWidth: 200,
+            minWidth: 180,
             Cell: CellWrap,
         },
         {
             Header: <Trans>list_url_table_header</Trans>,
             accessor: 'url',
-            minWidth: 200,
+            minWidth: 180,
             Cell: ({ value }) => (
                 <div className="logs__row">
                     {isValidAbsolutePath(value) ? value
@@ -72,17 +73,19 @@ class Table extends Component {
             Header: <Trans>last_time_updated_table_header</Trans>,
             accessor: 'lastUpdated',
             className: 'text-center',
-            minWidth: 150,
+            minWidth: 180,
             Cell: this.getDateCell,
         },
         {
             Header: <Trans>actions_table_header</Trans>,
-            accessor: 'url',
+            accessor: 'actions',
             className: 'text-center',
             width: 100,
             sortable: false,
+            resizable: false,
             Cell: (row) => {
-                const { value } = row;
+                const { original } = row;
+                const { url } = original;
                 const { t, toggleFilteringModal, handleDelete } = this.props;
 
                 return (
@@ -93,21 +96,21 @@ class Table extends Component {
                             title={t('edit_table_action')}
                             onClick={() => toggleFilteringModal({
                                 type: MODAL_TYPE.EDIT_FILTERS,
-                                url: value,
+                                url,
                             })
                             }
                         >
-                            <svg className="icons">
+                            <svg className="icons icon12">
                                 <use xlinkHref="#edit" />
                             </svg>
                         </button>
                         <button
                             type="button"
                             className="btn btn-icon btn-outline-secondary btn-sm"
-                            onClick={() => handleDelete(value)}
+                            onClick={() => handleDelete(url)}
                             title={t('delete_table_action')}
                         >
-                            <svg className="icons">
+                            <svg className="icons icon12">
                                 <use xlinkHref="#delete" />
                             </svg>
                         </button>

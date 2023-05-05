@@ -3,34 +3,26 @@ package aghtest
 
 import (
 	"io"
-	"os"
 	"testing"
 
 	"github.com/AdguardTeam/golibs/log"
 )
 
-// DiscardLogOutput runs tests with discarded logger output.
-func DiscardLogOutput(m *testing.M) {
-	// TODO(e.burkov): Refactor code and tests to not use the global mutable
-	// logger.
-	log.SetOutput(io.Discard)
-
-	os.Exit(m.Run())
-}
-
 // ReplaceLogWriter moves logger output to w and uses Cleanup method of t to
 // revert changes.
-func ReplaceLogWriter(t *testing.T, w io.Writer) {
-	stdWriter := log.Writer()
-	t.Cleanup(func() {
-		log.SetOutput(stdWriter)
-	})
+func ReplaceLogWriter(t testing.TB, w io.Writer) {
+	t.Helper()
+
+	prev := log.Writer()
+	t.Cleanup(func() { log.SetOutput(prev) })
 	log.SetOutput(w)
 }
 
 // ReplaceLogLevel sets logging level to l and uses Cleanup method of t to
 // revert changes.
-func ReplaceLogLevel(t *testing.T, l log.Level) {
+func ReplaceLogLevel(t testing.TB, l log.Level) {
+	t.Helper()
+
 	switch l {
 	case log.INFO, log.DEBUG, log.ERROR:
 		// Go on.
@@ -38,9 +30,7 @@ func ReplaceLogLevel(t *testing.T, l log.Level) {
 		t.Fatalf("wrong l value (must be one of %v, %v, %v)", log.INFO, log.DEBUG, log.ERROR)
 	}
 
-	stdLevel := log.GetLevel()
-	t.Cleanup(func() {
-		log.SetLevel(stdLevel)
-	})
+	prev := log.GetLevel()
+	t.Cleanup(func() { log.SetLevel(prev) })
 	log.SetLevel(l)
 }

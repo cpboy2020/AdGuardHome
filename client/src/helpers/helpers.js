@@ -13,7 +13,6 @@ import {
     ADDRESS_TYPES,
     CHECK_TIMEOUT,
     COMMENT_LINE_DEFAULT_TOKEN,
-    CUSTOM_FILTERING_RULES_ID,
     DEFAULT_DATE_FORMAT_OPTIONS,
     DEFAULT_LANGUAGE,
     DEFAULT_TIME_FORMAT,
@@ -22,10 +21,12 @@ import {
     FILTERED,
     FILTERED_STATUS,
     R_CLIENT_ID,
-    SERVICES_ID_NAME_MAP,
     STANDARD_DNS_PORT,
     STANDARD_HTTPS_PORT,
     STANDARD_WEB_PORT,
+    SPECIAL_FILTER_ID,
+    THEMES,
+    LOCAL_STORAGE_THEME_KEY,
 } from './constants';
 
 /**
@@ -75,6 +76,8 @@ export const normalizeLogs = (logs) => logs.map((log) => {
         service_name,
         original_answer,
         upstream,
+        cached,
+        ecs,
     } = log;
 
     const { name: domain, unicode_name: unicodeName, type } = question;
@@ -116,6 +119,8 @@ export const normalizeLogs = (logs) => logs.map((log) => {
         answer_dnssec,
         elapsedMs,
         upstream,
+        cached,
+        ecs,
     };
 });
 
@@ -299,10 +304,10 @@ export const redirectToCurrentProtocol = (values, httpPort = 80) => {
     const {
         protocol, hostname, hash, port,
     } = window.location;
-    const { enabled, port_https } = values;
+    const { enabled, force_https, port_https } = values;
     const httpsPort = port_https !== STANDARD_HTTPS_PORT ? `:${port_https}` : '';
 
-    if (protocol !== 'https:' && enabled && port_https) {
+    if (protocol !== 'https:' && enabled && force_https && port_https) {
         checkRedirect(`https://${hostname}${httpsPort}/${hash}`);
     } else if (protocol === 'https:' && enabled && port_https && port_https !== parseInt(port, 10)) {
         checkRedirect(`https://${hostname}${httpsPort}/${hash}`);
@@ -385,6 +390,12 @@ export const toggleAllServices = (services, change, isSelected) => {
     services.forEach((service) => change(`blocked_services.${service.id}`, isSelected));
 };
 
+export const msToSeconds = (milliseconds) => Math.floor(milliseconds / 1000);
+
+export const msToMinutes = (milliseconds) => Math.floor(milliseconds / 1000 / 60);
+
+export const msToHours = (milliseconds) => Math.floor(milliseconds / 1000 / 60 / 60);
+
 export const secondsToMilliseconds = (seconds) => {
     if (seconds) {
         return seconds * 1000;
@@ -392,6 +403,8 @@ export const secondsToMilliseconds = (seconds) => {
 
     return seconds;
 };
+
+export const msToDays = (milliseconds) => Math.floor(milliseconds / 1000 / 60 / 60 / 24);
 
 export const normalizeRulesTextarea = (text) => text?.replace(/^\n/g, '')
     .replace(/\n\s*\n/g, '\n');
@@ -668,6 +681,63 @@ export const setHtmlLangAttr = (language) => {
 };
 
 /**
+ * Set local storage field
+ *
+ * @param {string} key
+ * @param {string} value
+ */
+
+export const setStorageItem = (key, value) => {
+    if (window.localStorage) {
+        window.localStorage.setItem(key, value);
+    }
+};
+
+/**
+ * Get local storage field
+ *
+ * @param {string} key
+ */
+
+export const getStorageItem = (key) => (window.localStorage
+    ? window.localStorage.getItem(key)
+    : null);
+
+/**
+ * Set local storage theme field
+ *
+ * @param {string} theme
+ */
+
+export const setTheme = (theme) => {
+    setStorageItem(LOCAL_STORAGE_THEME_KEY, theme);
+};
+
+/**
+ * Get local storage theme field
+ *
+ * @returns {string}
+ */
+
+export const getTheme = () => getStorageItem(LOCAL_STORAGE_THEME_KEY) || THEMES.light;
+
+/**
+ * Sets UI theme.
+ *
+ * @param theme
+ */
+export const setUITheme = (theme) => {
+    let currentTheme = theme || getTheme();
+
+    if (currentTheme === THEMES.auto) {
+        const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        currentTheme = prefersDark ? THEMES.dark : THEMES.light;
+    }
+    setTheme(currentTheme);
+    document.body.dataset.theme = currentTheme;
+};
+
+/**
  * @param values {object}
  * @returns {object}
  */
@@ -689,8 +759,8 @@ export const replaceZeroWithEmptyString = (value) => (parseInt(value, 10) === 0 
  * @returns {string}
  */
 export const getLogsUrlParams = (search, response_status) => `?${queryString.stringify({
-    search,
-    response_status,
+    search: search || undefined,
+    response_status: response_status || undefined,
 })}`;
 
 export const processContent = (
@@ -752,8 +822,10 @@ const getAddressesComparisonBytes = (item) => {
  */
 export const sortIp = (a, b) => {
     try {
-        const comparisonBytesA = getAddressesComparisonBytes(a);
-        const comparisonBytesB = getAddressesComparisonBytes(b);
+        const comparisonBytesA = Array.isArray(a)
+            ? getAddressesComparisonBytes(a[0]) : getAddressesComparisonBytes(a);
+        const comparisonBytesB = Array.isArray(b)
+            ? getAddressesComparisonBytes(b[0]) : getAddressesComparisonBytes(b);
 
         for (let i = 0; i < comparisonBytesA.length; i += 1) {
             const byteA = comparisonBytesA[i];
@@ -773,6 +845,30 @@ export const sortIp = (a, b) => {
     }
 };
 
+
+/**
+ * @param {number} filterId
+ * @returns {string}
+ */
+export const getSpecialFilterName = (filterId) => {
+    switch (filterId) {
+        case SPECIAL_FILTER_ID.CUSTOM_FILTERING_RULES:
+            return i18n.t('custom_filter_rules');
+        case SPECIAL_FILTER_ID.SYSTEM_HOSTS:
+            return i18n.t('system_host_files');
+        case SPECIAL_FILTER_ID.BLOCKED_SERVICES:
+            return i18n.t('blocked_services');
+        case SPECIAL_FILTER_ID.PARENTAL:
+            return i18n.t('parental_control');
+        case SPECIAL_FILTER_ID.SAFE_BROWSING:
+            return i18n.t('safe_browsing');
+        case SPECIAL_FILTER_ID.SAFE_SEARCH:
+            return i18n.t('safe_search');
+        default:
+            return i18n.t('unknown_filter', { filterId });
+    }
+};
+
 /**
  * @param {array} filters
  * @param {array} whitelistFilters
@@ -784,16 +880,15 @@ export const getFilterName = (
     filters,
     whitelistFilters,
     filterId,
-    customFilterTranslationKey = 'custom_filter_rules',
     resolveFilterName = (filter) => (filter ? filter.name : i18n.t('unknown_filter', { filterId })),
 ) => {
-    if (filterId === CUSTOM_FILTERING_RULES_ID) {
-        return i18n.t(customFilterTranslationKey);
+    const specialFilterIds = Object.values(SPECIAL_FILTER_ID);
+    if (specialFilterIds.includes(filterId)) {
+        return getSpecialFilterName(filterId);
     }
 
     const matchIdPredicate = (filter) => filter.id === filterId;
     const filter = filters.find(matchIdPredicate) || whitelistFilters.find(matchIdPredicate);
-
     return resolveFilterName(filter);
 };
 
@@ -962,7 +1057,22 @@ export const filterOutComments = (lines) => lines
     .filter((line) => !line.startsWith(COMMENT_LINE_DEFAULT_TOKEN));
 
 /**
- * @param {string} serviceId
+ * @param {array} services
+ * @param {string} id
  * @returns {string}
  */
-export const getServiceName = (serviceId) => SERVICES_ID_NAME_MAP[serviceId] || serviceId;
+export const getService = (services, id) => services.find((s) => s.id === id);
+
+/**
+ * @param {array} services
+ * @param {string} id
+ * @returns {string}
+ */
+export const getServiceName = (services, id) => getService(services, id)?.name;
+
+/**
+ * @param {array} services
+ * @param {string} id
+ * @returns {string}
+ */
+export const getServiceIcon = (services, id) => getService(services, id)?.icon_svg;

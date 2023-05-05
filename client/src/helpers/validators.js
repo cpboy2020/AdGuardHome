@@ -1,4 +1,5 @@
 import i18next from 'i18next';
+import stringLength from 'string-length';
 
 import {
     MAX_PORT,
@@ -13,6 +14,7 @@ import {
     UNSAFE_PORTS,
     R_CLIENT_ID,
     R_DOMAIN,
+    MIN_PASSWORD_LENGTH,
 } from './constants';
 import { ip4ToInt, isValidAbsolutePath } from './form';
 import { isIpInCidr, parseSubnetMask } from './helpers';
@@ -68,14 +70,18 @@ export const validateIpv4 = (value) => {
  * @param allValues
  */
 export const validateNotInRange = (value, allValues) => {
+    if (!allValues.v4) {
+        return undefined;
+    }
+
     const { range_start, range_end } = allValues.v4;
 
     if (range_start && validateIpv4(range_start)) {
-        return 'form_error_ip4_range_start_format';
+        return undefined;
     }
 
     if (range_end && validateIpv4(range_end)) {
-        return 'form_error_ip4_range_end_format';
+        return undefined;
     }
 
     const isAboveMin = range_start && ip4ToInt(value) >= ip4ToInt(range_start);
@@ -86,14 +92,6 @@ export const validateNotInRange = (value, allValues) => {
             start: range_start,
             end: range_end,
         });
-    }
-
-    if (!range_end && isAboveMin) {
-        return 'lower_range_start_error';
-    }
-
-    if (!range_start && isBelowMax) {
-        return 'greater_range_end_error';
     }
 
     return undefined;
@@ -112,7 +110,7 @@ export const validateGatewaySubnetMask = (_, allValues) => {
     const { subnet_mask, gateway_ip } = allValues.v4;
 
     if (validateIpv4(gateway_ip)) {
-        return 'form_error_ip4_gateway_format';
+        return 'gateway_or_subnet_invalid';
     }
 
     return parseSubnetMask(subnet_mask) ? undefined : 'gateway_or_subnet_invalid';
@@ -131,6 +129,10 @@ export const validateIpForGatewaySubnetMask = (value, allValues) => {
     const {
         gateway_ip, subnet_mask,
     } = allValues.v4;
+
+    if ((gateway_ip && validateIpv4(gateway_ip)) || (subnet_mask && validateIpv4(subnet_mask))) {
+        return undefined;
+    }
 
     const subnetPrefix = parseSubnetMask(subnet_mask);
 
@@ -228,17 +230,6 @@ export const validateMac = (value) => {
 
 /**
  * @param value {number}
- * @returns {boolean|*}
- */
-export const validateBiggerOrEqualZeroValue = (value) => {
-    if (value < 0) {
-        return 'form_error_negative';
-    }
-    return false;
-};
-
-/**
- * @param value {number}
  * @returns {undefined|string}
  */
 export const validatePort = (value) => {
@@ -327,10 +318,31 @@ export const validatePath = (value) => {
  * @param cidr {string}
  * @returns {Function}
  */
-
 export const validateIpv4InCidr = (valueIp, allValues) => {
     if (!isIpInCidr(valueIp, allValues.cidr)) {
         return i18next.t('form_error_subnet', { ip: valueIp, cidr: allValues.cidr });
+    }
+    return undefined;
+};
+
+/**
+ * @param value {string}
+ * @returns {Function}
+ */
+export const validatePasswordLength = (value) => {
+    if (value && stringLength(value) < MIN_PASSWORD_LENGTH) {
+        return i18next.t('form_error_password_length', { value: MIN_PASSWORD_LENGTH });
+    }
+    return undefined;
+};
+
+/**
+ * @param value {string}
+ * @returns {Function}
+ */
+export const validateIpGateway = (value, allValues) => {
+    if (value === allValues.gatewayIp) {
+        return i18next.t('form_error_gateway_ip');
     }
     return undefined;
 };

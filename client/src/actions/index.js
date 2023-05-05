@@ -6,14 +6,22 @@ import endsWith from 'lodash/endsWith';
 import escapeRegExp from 'lodash/escapeRegExp';
 import React from 'react';
 import { compose } from 'redux';
-import { splitByNewLine, sortClients, filterOutComments } from '../helpers/helpers';
+import {
+    splitByNewLine,
+    sortClients,
+    filterOutComments,
+    msToSeconds,
+    msToMinutes,
+    msToHours,
+} from '../helpers/helpers';
 import {
     BLOCK_ACTIONS,
     CHECK_TIMEOUT,
     STATUS_RESPONSE,
     SETTINGS_NAMES,
     FORM_NAME,
-    GETTING_STARTED_LINK,
+    MANUAL_UPDATE_LINK,
+    DISABLE_PROTECTION_TIMINGS,
 } from '../helpers/constants';
 import { areEqualVersions } from '../helpers/version';
 import { getTlsStatus } from './encryption';
@@ -24,6 +32,12 @@ import { getFilteringStatus, setRules } from './filtering';
 export const toggleSettingStatus = createAction('SETTING_STATUS_TOGGLE');
 export const showSettingsFailure = createAction('SETTINGS_FAILURE_SHOW');
 
+/**
+ *
+ * @param {*} settingKey = SETTINGS_NAMES
+ * @param {*} status: boolean | SafeSearchConfig
+ * @returns
+ */
 export const toggleSetting = (settingKey, status) => async (dispatch) => {
     let successMessage = '';
     try {
@@ -49,14 +63,9 @@ export const toggleSetting = (settingKey, status) => async (dispatch) => {
                 dispatch(toggleSettingStatus({ settingKey }));
                 break;
             case SETTINGS_NAMES.safesearch:
-                if (status) {
-                    successMessage = 'disabled_safe_search_toast';
-                    await apiClient.disableSafesearch();
-                } else {
-                    successMessage = 'enabled_save_search_toast';
-                    await apiClient.enableSafesearch();
-                }
-                dispatch(toggleSettingStatus({ settingKey }));
+                successMessage = 'updated_save_search_toast';
+                await apiClient.updateSafesearch(status);
+                dispatch(toggleSettingStatus({ settingKey, value: status }));
                 break;
             default:
                 break;
@@ -71,7 +80,9 @@ export const initSettingsRequest = createAction('SETTINGS_INIT_REQUEST');
 export const initSettingsFailure = createAction('SETTINGS_INIT_FAILURE');
 export const initSettingsSuccess = createAction('SETTINGS_INIT_SUCCESS');
 
-export const initSettings = (settingsList) => async (dispatch) => {
+export const initSettings = (settingsList = {
+    safebrowsing: {}, parental: {},
+}) => async (dispatch) => {
     dispatch(initSettingsRequest());
     try {
         const safebrowsingStatus = await apiClient.getSafebrowsingStatus();
@@ -80,7 +91,6 @@ export const initSettings = (settingsList) => async (dispatch) => {
         const {
             safebrowsing,
             parental,
-            safesearch,
         } = settingsList;
         const newSettingsList = {
             safebrowsing: {
@@ -92,8 +102,7 @@ export const initSettings = (settingsList) => async (dispatch) => {
                 enabled: parentalStatus.enabled,
             },
             safesearch: {
-                ...safesearch,
-                enabled: safesearchStatus.enabled,
+                ...safesearchStatus,
             },
         };
         dispatch(initSettingsSuccess({ settingsList: newSettingsList }));
@@ -107,17 +116,52 @@ export const toggleProtectionRequest = createAction('TOGGLE_PROTECTION_REQUEST')
 export const toggleProtectionFailure = createAction('TOGGLE_PROTECTION_FAILURE');
 export const toggleProtectionSuccess = createAction('TOGGLE_PROTECTION_SUCCESS');
 
-export const toggleProtection = (status) => async (dispatch) => {
+const getDisabledMessage = (time) => {
+    switch (time) {
+        case DISABLE_PROTECTION_TIMINGS.HALF_MINUTE:
+            return i18next.t(
+                'disable_notify_for_seconds',
+                { count: msToSeconds(DISABLE_PROTECTION_TIMINGS.HALF_MINUTE) },
+            );
+        case DISABLE_PROTECTION_TIMINGS.MINUTE:
+            return i18next.t(
+                'disable_notify_for_minutes',
+                { count: msToMinutes(DISABLE_PROTECTION_TIMINGS.MINUTE) },
+            );
+        case DISABLE_PROTECTION_TIMINGS.TEN_MINUTES:
+            return i18next.t(
+                'disable_notify_for_minutes',
+                { count: msToMinutes(DISABLE_PROTECTION_TIMINGS.TEN_MINUTES) },
+            );
+        case DISABLE_PROTECTION_TIMINGS.HOUR:
+            return i18next.t(
+                'disable_notify_for_hours',
+                { count: msToHours(DISABLE_PROTECTION_TIMINGS.HOUR) },
+            );
+        case DISABLE_PROTECTION_TIMINGS.TOMORROW:
+            return i18next.t('disable_notify_until_tomorrow');
+        default:
+            return 'disabled_protection';
+    }
+};
+
+export const toggleProtection = (status, time = null) => async (dispatch) => {
     dispatch(toggleProtectionRequest());
     try {
-        const successMessage = status ? 'disabled_protection' : 'enabled_protection';
-        await apiClient.setDnsConfig({ protection_enabled: !status });
+        const successMessage = status ? getDisabledMessage(time) : 'enabled_protection';
+        await apiClient.setProtection({ enabled: !status, duration: time });
         dispatch(addSuccessToast(successMessage));
-        dispatch(toggleProtectionSuccess());
+        dispatch(toggleProtectionSuccess({ disabledDuration: time }));
     } catch (error) {
         dispatch(addErrorToast({ error }));
         dispatch(toggleProtectionFailure());
     }
+};
+
+export const setDisableDurationTime = createAction('SET_DISABLED_DURATION_TIME');
+
+export const setProtectionTimerTime = (updatedTime) => async (dispatch) => {
+    dispatch(setDisableDurationTime({ timeToEnableProtection: updatedTime }));
 };
 
 export const getVersionRequest = createAction('GET_VERSION_REQUEST');
@@ -141,7 +185,7 @@ export const getVersion = (recheck = false) => async (dispatch, getState) => {
             }
         }
     } catch (error) {
-        dispatch(addErrorToast({ error }));
+        dispatch(addErrorToast({ error: 'version_request_error' }));
         dispatch(getVersionFailure());
     }
 };
@@ -193,7 +237,7 @@ export const getUpdate = () => async (dispatch, getState) => {
     const handleRequestError = () => {
         const options = {
             components: {
-                a: <a href={GETTING_STARTED_LINK} target="_blank"
+                a: <a href={MANUAL_UPDATE_LINK} target="_blank"
                       rel="noopener noreferrer" />,
             },
         };
@@ -272,6 +316,9 @@ export const getDnsStatus = () => async (dispatch) => {
 
     const handleRequestSuccess = (response) => {
         const dnsStatus = response.data;
+        if (dnsStatus.protection_disabled_duration === 0) {
+            dnsStatus.protection_disabled_duration = null;
+        }
         const { running } = dnsStatus;
         const runningStatus = dnsStatus && running;
         if (runningStatus === true) {
@@ -314,13 +361,15 @@ export const testUpstream = (
         const testMessages = Object.keys(upstreamResponse)
             .map((key) => {
                 const message = upstreamResponse[key];
-                if (message !== 'OK') {
+                if (message.startsWith('WARNING:')) {
+                    dispatch(addErrorToast({ error: i18next.t('dns_test_warning_toast', { key }) }));
+                } else if (message !== 'OK') {
                     dispatch(addErrorToast({ error: i18next.t('dns_test_not_ok_toast', { key }) }));
                 }
                 return message;
             });
 
-        if (testMessages.every((message) => message === 'OK')) {
+        if (testMessages.every((message) => message === 'OK' || message.startsWith('WARNING:'))) {
             dispatch(addSuccessToast('dns_test_ok_toast'));
         }
 
@@ -353,7 +402,7 @@ export const changeLanguageSuccess = createAction('CHANGE_LANGUAGE_SUCCESS');
 export const changeLanguage = (lang) => async (dispatch) => {
     dispatch(changeLanguageRequest());
     try {
-        await apiClient.changeLanguage(lang);
+        await apiClient.changeLanguage({ language: lang });
         dispatch(changeLanguageSuccess());
     } catch (error) {
         dispatch(addErrorToast({ error }));
@@ -361,18 +410,18 @@ export const changeLanguage = (lang) => async (dispatch) => {
     }
 };
 
-export const getLanguageRequest = createAction('GET_LANGUAGE_REQUEST');
-export const getLanguageFailure = createAction('GET_LANGUAGE_FAILURE');
-export const getLanguageSuccess = createAction('GET_LANGUAGE_SUCCESS');
+export const changeThemeRequest = createAction('CHANGE_THEME_REQUEST');
+export const changeThemeFailure = createAction('CHANGE_THEME_FAILURE');
+export const changeThemeSuccess = createAction('CHANGE_THEME_SUCCESS');
 
-export const getLanguage = () => async (dispatch) => {
-    dispatch(getLanguageRequest());
+export const changeTheme = (theme) => async (dispatch) => {
+    dispatch(changeThemeRequest());
     try {
-        const language = await apiClient.getCurrentLanguage();
-        dispatch(getLanguageSuccess(language));
+        await apiClient.changeTheme({ theme });
+        dispatch(changeThemeSuccess({ theme }));
     } catch (error) {
         dispatch(addErrorToast({ error }));
-        dispatch(getLanguageFailure());
+        dispatch(changeThemeFailure());
     }
 };
 
@@ -419,7 +468,10 @@ export const findActiveDhcpFailure = createAction('FIND_ACTIVE_DHCP_FAILURE');
 export const findActiveDhcp = (name) => async (dispatch, getState) => {
     dispatch(findActiveDhcpRequest());
     try {
-        const activeDhcp = await apiClient.findActiveDhcp(name);
+        const req = {
+            interface: name,
+        };
+        const activeDhcp = await apiClient.findActiveDhcp(req);
         dispatch(findActiveDhcpSuccess(activeDhcp));
         const { check, interface_name, interfaces } = getState().dhcp;
         const selectedInterface = getState().form[FORM_NAME.DHCP_INTERFACES].values.interface_name;

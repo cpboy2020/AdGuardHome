@@ -3,12 +3,12 @@ package querylog
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
@@ -24,18 +24,24 @@ const (
 type queryLog struct {
 	findClient func(ids []string) (c *Client, err error)
 
-	conf    *Config
-	lock    sync.Mutex
-	logFile string // path to the log file
+	// confMu protects conf.
+	confMu *sync.RWMutex
+	conf   *Config
+
+	// logFile is the path to the log file.
+	logFile string
 
 	// bufferLock protects buffer.
 	bufferLock sync.RWMutex
-	// buffer contains recent log entries.
+	// buffer contains recent log entries.  The entries in this buffer must not
+	// be modified.
 	buffer []*logEntry
 
 	fileFlushLock sync.Mutex // synchronize a file-flushing goroutine and main thread
 	flushPending  bool       // don't start another goroutine while the previous one is still running
 	fileWriteLock sync.Mutex
+
+	anonymizer *aghnet.IPMut
 }
 
 // ClientProto values are names of the client protocols.
@@ -67,38 +73,24 @@ func NewClientProto(s string) (cp ClientProto, err error) {
 	}
 }
 
-// logEntry - represents a single log entry
-type logEntry struct {
-	// client is the found client information, if any.
-	client *Client
-
-	IP   net.IP    `json:"IP"` // Client IP
-	Time time.Time `json:"T"`
-
-	QHost  string `json:"QH"`
-	QType  string `json:"QT"`
-	QClass string `json:"QC"`
-
-	ClientID    string      `json:"CID,omitempty"`
-	ClientProto ClientProto `json:"CP"`
-
-	Answer     []byte `json:",omitempty"` // sometimes empty answers happen like binerdunt.top or rev2.globalrootservers.net
-	OrigAnswer []byte `json:",omitempty"`
-
-	Result   filtering.Result
-	Elapsed  time.Duration
-	Upstream string `json:",omitempty"` // if empty, means it was cached
-}
-
 func (l *queryLog) Start() {
 	if l.conf.HTTPRegister != nil {
 		l.initWeb()
 	}
+
 	go l.periodicRotate()
 }
 
 func (l *queryLog) Close() {
-	_ = l.flushLogBuffer(true)
+	l.confMu.RLock()
+	defer l.confMu.RUnlock()
+
+	if l.conf.FileEnabled {
+		err := l.flushLogBuffer()
+		if err != nil {
+			log.Error("querylog: closing: %s", err)
+		}
+	}
 }
 
 func checkInterval(ivl time.Duration) (ok bool) {
@@ -114,8 +106,26 @@ func checkInterval(ivl time.Duration) (ok bool) {
 	return ivl == quarterDay || ivl == day || ivl == week || ivl == month || ivl == threeMonths
 }
 
+// validateIvl returns an error if ivl is less than an hour or more than a
+// year.
+func validateIvl(ivl time.Duration) (err error) {
+	if ivl < time.Hour {
+		return errors.Error("less than an hour")
+	}
+
+	if ivl > timeutil.Day*365 {
+		return errors.Error("more than a year")
+	}
+
+	return nil
+}
+
 func (l *queryLog) WriteDiskConfig(c *Config) {
+	l.confMu.RLock()
+	defer l.confMu.RUnlock()
+
 	*c = *l.conf
+	c.Ignored = l.conf.Ignored.Clone()
 }
 
 // Clear memory buffer and remove log files
@@ -123,10 +133,13 @@ func (l *queryLog) clear() {
 	l.fileFlushLock.Lock()
 	defer l.fileFlushLock.Unlock()
 
-	l.bufferLock.Lock()
-	l.buffer = nil
-	l.flushPending = false
-	l.bufferLock.Unlock()
+	func() {
+		l.bufferLock.Lock()
+		defer l.bufferLock.Unlock()
+
+		l.buffer = nil
+		l.flushPending = false
+	}()
 
 	oldLogFile := l.logFile + ".1"
 	err := os.Remove(oldLogFile)
@@ -139,17 +152,25 @@ func (l *queryLog) clear() {
 		log.Error("removing log file %q: %s", l.logFile, err)
 	}
 
-	log.Debug("Query log: cleared")
+	log.Debug("querylog: cleared")
 }
 
-func (l *queryLog) Add(params AddParams) {
-	var err error
+func (l *queryLog) Add(params *AddParams) {
+	var isEnabled, fileIsEnabled bool
+	var memSize uint32
+	func() {
+		l.confMu.RLock()
+		defer l.confMu.RUnlock()
 
-	if !l.conf.Enabled {
+		isEnabled, fileIsEnabled = l.conf.Enabled, l.conf.FileEnabled
+		memSize = l.conf.MemSize
+	}()
+
+	if !isEnabled {
 		return
 	}
 
-	err = params.validate()
+	err := params.validate()
 	if err != nil {
 		log.Error("querylog: adding record: %s, skipping", err)
 
@@ -161,66 +182,89 @@ func (l *queryLog) Add(params AddParams) {
 	}
 
 	now := time.Now()
-	entry := logEntry{
-		IP:   l.getClientIP(params.ClientIP),
+	q := params.Question.Question[0]
+	entry := &logEntry{
 		Time: now,
 
-		Result:      *params.Result,
-		Elapsed:     params.Elapsed,
-		Upstream:    params.Upstream,
+		QHost:  strings.ToLower(q.Name[:len(q.Name)-1]),
+		QType:  dns.Type(q.Qtype).String(),
+		QClass: dns.Class(q.Qclass).String(),
+
 		ClientID:    params.ClientID,
 		ClientProto: params.ClientProto,
-	}
-	q := params.Question.Question[0]
-	entry.QHost = strings.ToLower(q.Name[:len(q.Name)-1]) // remove the last dot
-	entry.QType = dns.Type(q.Qtype).String()
-	entry.QClass = dns.Class(q.Qclass).String()
 
-	if params.Answer != nil {
-		var a []byte
-		a, err = params.Answer.Pack()
-		if err != nil {
-			log.Error("querylog: Answer.Pack(): %s", err)
+		Result:   *params.Result,
+		Upstream: params.Upstream,
 
-			return
-		}
+		IP: params.ClientIP,
 
-		entry.Answer = a
+		Elapsed: params.Elapsed,
+
+		Cached:            params.Cached,
+		AuthenticatedData: params.AuthenticatedData,
 	}
 
-	if params.OrigAnswer != nil {
-		var a []byte
-		a, err = params.OrigAnswer.Pack()
-		if err != nil {
-			log.Error("querylog: OrigAnswer.Pack(): %s", err)
-
-			return
-		}
-
-		entry.OrigAnswer = a
+	if params.ReqECS != nil {
+		entry.ReqECS = params.ReqECS.String()
 	}
 
-	l.bufferLock.Lock()
-	l.buffer = append(l.buffer, &entry)
+	entry.addResponse(params.Answer, false)
+	entry.addResponse(params.OrigAnswer, true)
+
 	needFlush := false
+	func() {
+		l.bufferLock.Lock()
+		defer l.bufferLock.Unlock()
 
-	if !l.conf.FileEnabled {
-		if len(l.buffer) > int(l.conf.MemSize) {
-			// writing to file is disabled - just remove the oldest entry from array
-			l.buffer = l.buffer[1:]
-		}
-	} else if !l.flushPending {
-		needFlush = len(l.buffer) >= int(l.conf.MemSize)
-		if needFlush {
-			l.flushPending = true
-		}
-	}
-	l.bufferLock.Unlock()
+		l.buffer = append(l.buffer, entry)
 
-	// if buffer needs to be flushed to disk, do it now
+		if !fileIsEnabled {
+			if len(l.buffer) > int(memSize) {
+				// Writing to file is disabled, so just remove the oldest entry
+				// from the slices.
+				//
+				// TODO(a.garipov): This should be replaced by a proper ring
+				// buffer, but it's currently difficult to do that.
+				l.buffer[0] = nil
+				l.buffer = l.buffer[1:]
+			}
+		} else if !l.flushPending {
+			needFlush = len(l.buffer) >= int(memSize)
+			if needFlush {
+				l.flushPending = true
+			}
+		}
+	}()
+
 	if needFlush {
 		go func() {
-			_ = l.flushLogBuffer(false)
+			flushErr := l.flushLogBuffer()
+			if flushErr != nil {
+				log.Error("querylog: flushing after adding: %s", err)
+			}
 		}()
 	}
+}
+
+// ShouldLog returns true if request for the host should be logged.
+func (l *queryLog) ShouldLog(host string, _, _ uint16, ids []string) bool {
+	l.confMu.RLock()
+	defer l.confMu.RUnlock()
+
+	c, err := l.findClient(ids)
+	if err != nil {
+		log.Error("querylog: finding client: %s", err)
+	}
+
+	if c != nil && c.IgnoreQueryLog {
+		return false
+	}
+
+	return !l.isIgnored(host)
+}
+
+// isIgnored returns true if the host is in the ignored domains list.  It
+// assumes that l.confMu is locked for reading.
+func (l *queryLog) isIgnored(host string) bool {
+	return l.conf.Ignored.Has(host)
 }

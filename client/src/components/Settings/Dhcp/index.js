@@ -102,6 +102,7 @@ const Dhcp = () => {
             Object.values(DHCP_FORM_NAMES)
                 .forEach((formName) => dispatch(destroy(formName)));
             dispatch(resetDhcp());
+            dispatch(getDhcpStatus());
         }
     };
 
@@ -187,8 +188,8 @@ const Dhcp = () => {
 
     const inputtedIPv4values = dhcp?.values?.v4?.gateway_ip && dhcp?.values?.v4?.subnet_mask;
     const isEmptyConfig = !Object.values(dhcp?.values?.v4 ?? {}).some(Boolean);
-    const disabledLeasesButton = dhcp?.syncErrors || interfaces?.syncErrors
-        || !isInterfaceIncludesIpv4 || isEmptyConfig || processingConfig || !inputtedIPv4values;
+    const disabledLeasesButton = Boolean(dhcp?.syncErrors || interfaces?.syncErrors
+        || !isInterfaceIncludesIpv4 || isEmptyConfig || processingConfig || !inputtedIPv4values);
     const cidr = inputtedIPv4values ? `${dhcp?.values?.v4?.gateway_ip}/${subnetMaskToBitMask(dhcp?.values?.v4?.subnet_mask)}` : '';
 
     return <>
@@ -259,7 +260,7 @@ const Dhcp = () => {
             >
                 <div className="row">
                     <div className="col">
-                        <Leases leases={leases} />
+                        <Leases leases={leases} disabledLeasesButton={disabledLeasesButton}/>
                     </div>
                 </div>
             </Card>}
@@ -277,6 +278,7 @@ const Dhcp = () => {
                             cidr={cidr}
                             rangeStart={dhcp?.values?.v4?.range_start}
                             rangeEnd={dhcp?.values?.v4?.range_end}
+                            gatewayIp={dhcp?.values?.v4?.gateway_ip}
                         />
                         <div className="btn-list mt-2">
                             <button

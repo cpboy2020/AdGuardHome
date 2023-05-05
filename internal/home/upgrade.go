@@ -1,6 +1,7 @@
 package home
 
 import (
+	"bytes"
 	"fmt"
 	"net/url"
 	"os"
@@ -17,17 +18,16 @@ import (
 	"github.com/AdguardTeam/golibs/timeutil"
 	"github.com/google/renameio/maybe"
 	"golang.org/x/crypto/bcrypt"
-	yaml "gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v3"
 )
 
 // currentSchemaVersion is the current schema version.
-const currentSchemaVersion = 12
+const currentSchemaVersion = 20
 
 // These aliases are provided for convenience.
 type (
-	any  = interface{}
 	yarr = []any
-	yobj = map[any]any
+	yobj = map[string]any
 )
 
 // Performs necessary upgrade operations if needed
@@ -41,7 +41,8 @@ func upgradeConfig() error {
 
 	err = yaml.Unmarshal(body, &diskConf)
 	if err != nil {
-		log.Printf("Couldn't parse config file: %s", err)
+		log.Printf("parsing config file for upgrade: %s", err)
+
 		return err
 	}
 
@@ -85,6 +86,14 @@ func upgradeConfigSchema(oldVersion int, diskConf yobj) (err error) {
 		upgradeSchema9to10,
 		upgradeSchema10to11,
 		upgradeSchema11to12,
+		upgradeSchema12to13,
+		upgradeSchema13to14,
+		upgradeSchema14to15,
+		upgradeSchema15to16,
+		upgradeSchema16to17,
+		upgradeSchema17to18,
+		upgradeSchema18to19,
+		upgradeSchema19to20,
 	}
 
 	n := 0
@@ -103,16 +112,20 @@ func upgradeConfigSchema(oldVersion int, diskConf yobj) (err error) {
 		return fmt.Errorf("unknown configuration schema version %d", oldVersion)
 	}
 
-	body, err := yaml.Marshal(diskConf)
+	buf := &bytes.Buffer{}
+	enc := yaml.NewEncoder(buf)
+	enc.SetIndent(2)
+
+	err = enc.Encode(diskConf)
 	if err != nil {
 		return fmt.Errorf("generating new config: %w", err)
 	}
 
-	config.fileData = body
+	config.fileData = buf.Bytes()
 	confFile := config.getConfigFilename()
-	err = maybe.WriteFile(confFile, body, 0o644)
+	err = maybe.WriteFile(confFile, config.fileData, 0o644)
 	if err != nil {
-		return fmt.Errorf("saving new config: %w", err)
+		return fmt.Errorf("writing new config: %w", err)
 	}
 
 	return nil
@@ -172,16 +185,16 @@ func upgradeSchema2to3(diskConf yobj) error {
 		return fmt.Errorf("no DNS configuration in config file")
 	}
 
-	// Convert interface{} to yobj
+	// Convert any to yobj
 	newDNSConfig := make(yobj)
 
 	switch v := dnsConfig.(type) {
-	case map[interface{}]interface{}:
+	case yobj:
 		for k, v := range v {
 			newDNSConfig[fmt.Sprint(k)] = v
 		}
 	default:
-		return fmt.Errorf("dns configuration is not a map")
+		return fmt.Errorf("unexpected type of dns: %T", dnsConfig)
 	}
 
 	// Replace bootstrap_dns value filed with new array contains old bootstrap_dns inside
@@ -212,12 +225,12 @@ func upgradeSchema3to4(diskConf yobj) error {
 	}
 
 	switch arr := clients.(type) {
-	case []interface{}:
+	case []any:
 
 		for i := range arr {
 			switch c := arr[i].(type) {
 
-			case map[interface{}]interface{}:
+			case map[any]any:
 				c["use_global_blocked_services"] = true
 
 			default:
@@ -234,8 +247,9 @@ func upgradeSchema3to4(diskConf yobj) error {
 
 // Replace "auth_name", "auth_pass" string settings with an array:
 // users:
-// - name: "..."
-//   password: "..."
+//   - name: "..."
+//     password: "..."
+//
 // ...
 func upgradeSchema4to5(diskConf yobj) error {
 	log.Printf("%s(): called", funcName())
@@ -271,27 +285,29 @@ func upgradeSchema4to5(diskConf yobj) error {
 		log.Fatalf("Can't use password \"%s\": bcrypt.GenerateFromPassword: %s", passStr, err)
 		return nil
 	}
-	u := User{
+	u := webUser{
 		Name:         nameStr,
 		PasswordHash: string(hash),
 	}
-	users := []User{u}
+	users := []webUser{u}
 	diskConf["users"] = users
 	return nil
 }
 
 // clients:
 // ...
-//   ip: 127.0.0.1
-//   mac: ...
+//
+//	ip: 127.0.0.1
+//	mac: ...
 //
 // ->
 //
 // clients:
 // ...
-//   ids:
-//   - 127.0.0.1
-//   - ...
+//
+//	ids:
+//	- 127.0.0.1
+//	- ...
 func upgradeSchema5to6(diskConf yobj) error {
 	log.Printf("%s(): called", funcName())
 
@@ -303,11 +319,11 @@ func upgradeSchema5to6(diskConf yobj) error {
 	}
 
 	switch arr := clients.(type) {
-	case []interface{}:
+	case []any:
 		for i := range arr {
 			switch c := arr[i].(type) {
-			case map[interface{}]interface{}:
-				var ipVal interface{}
+			case map[any]any:
+				var ipVal any
 				ipVal, ok = c["ip"]
 				ids := []string{}
 				if ok {
@@ -322,7 +338,7 @@ func upgradeSchema5to6(diskConf yobj) error {
 					}
 				}
 
-				var macVal interface{}
+				var macVal any
 				macVal, ok = c["mac"]
 				if ok {
 					var mac string
@@ -349,19 +365,21 @@ func upgradeSchema5to6(diskConf yobj) error {
 }
 
 // dhcp:
-//   enabled: false
-//   interface_name: vboxnet0
-//   gateway_ip: 192.168.56.1
-//   ...
+//
+//	enabled: false
+//	interface_name: vboxnet0
+//	gateway_ip: 192.168.56.1
+//	...
 //
 // ->
 //
 // dhcp:
-//   enabled: false
-//   interface_name: vboxnet0
-//   dhcpv4:
-//     gateway_ip: 192.168.56.1
-//     ...
+//
+//	enabled: false
+//	interface_name: vboxnet0
+//	dhcpv4:
+//	  gateway_ip: 192.168.56.1
+//	  ...
 func upgradeSchema6to7(diskConf yobj) error {
 	log.Printf("Upgrade yaml: 6 to 7")
 
@@ -373,7 +391,7 @@ func upgradeSchema6to7(diskConf yobj) error {
 	}
 
 	switch dhcp := dhcpVal.(type) {
-	case map[interface{}]interface{}:
+	case map[any]any:
 		var str string
 		str, ok = dhcp["gateway_ip"].(string)
 		if !ok {
@@ -437,15 +455,14 @@ func upgradeSchema6to7(diskConf yobj) error {
 
 // upgradeSchema7to8 performs the following changes:
 //
-//   # BEFORE:
-//   'dns':
-//     'bind_host': '127.0.0.1'
+//	# BEFORE:
+//	'dns':
+//	  'bind_host': '127.0.0.1'
 //
-//   # AFTER:
-//   'dns':
-//     'bind_hosts':
-//     - '127.0.0.1'
-//
+//	# AFTER:
+//	'dns':
+//	  'bind_hosts':
+//	  - '127.0.0.1'
 func upgradeSchema7to8(diskConf yobj) (err error) {
 	log.Printf("Upgrade yaml: 7 to 8")
 
@@ -475,14 +492,13 @@ func upgradeSchema7to8(diskConf yobj) (err error) {
 
 // upgradeSchema8to9 performs the following changes:
 //
-//   # BEFORE:
-//   'dns':
-//     'autohost_tld': 'lan'
+//	# BEFORE:
+//	'dns':
+//	  'autohost_tld': 'lan'
 //
-//   # AFTER:
-//   'dns':
-//     'local_domain_name': 'lan'
-//
+//	# AFTER:
+//	'dns':
+//	  'local_domain_name': 'lan'
 func upgradeSchema8to9(diskConf yobj) (err error) {
 	log.Printf("Upgrade yaml: 8 to 9")
 
@@ -558,16 +574,15 @@ func addQUICPort(ups string, port int) (withPort string) {
 
 // upgradeSchema9to10 performs the following changes:
 //
-//   # BEFORE:
-//   'dns':
-//     'upstream_dns':
-//      - 'quic://some-upstream.com'
+//	# BEFORE:
+//	'dns':
+//	  'upstream_dns':
+//	   - 'quic://some-upstream.com'
 //
-//   # AFTER:
-//   'dns':
-//     'upstream_dns':
-//      - 'quic://some-upstream.com:784'
-//
+//	# AFTER:
+//	'dns':
+//	  'upstream_dns':
+//	   - 'quic://some-upstream.com:784'
 func upgradeSchema9to10(diskConf yobj) (err error) {
 	log.Printf("Upgrade yaml: 9 to 10")
 
@@ -617,15 +632,14 @@ func upgradeSchema9to10(diskConf yobj) (err error) {
 
 // upgradeSchema10to11 performs the following changes:
 //
-//   # BEFORE:
-//   'rlimit_nofile': 42
+//	# BEFORE:
+//	'rlimit_nofile': 42
 //
-//   # AFTER:
-//   'os':
-//     'group': ''
-//     'rlimit_nofile': 42
-//     'user': ''
-//
+//	# AFTER:
+//	'os':
+//	  'group': ''
+//	  'rlimit_nofile': 42
+//	  'user': ''
 func upgradeSchema10to11(diskConf yobj) (err error) {
 	log.Printf("Upgrade yaml: 10 to 11")
 
@@ -652,12 +666,11 @@ func upgradeSchema10to11(diskConf yobj) (err error) {
 
 // upgradeSchema11to12 performs the following changes:
 //
-//   # BEFORE:
-//   'querylog_interval': 90
+//	# BEFORE:
+//	'querylog_interval': 90
 //
-//   # AFTER:
-//   'querylog_interval': '2160h'
-//
+//	# AFTER:
+//	'querylog_interval': '2160h'
 func upgradeSchema11to12(diskConf yobj) (err error) {
 	log.Printf("Upgrade yaml: 11 to 12")
 	diskConf["schema_version"] = 12
@@ -686,6 +699,441 @@ func upgradeSchema11to12(diskConf yobj) (err error) {
 	}
 
 	dns[field] = timeutil.Duration{Duration: time.Duration(qlogIvl) * timeutil.Day}
+
+	return nil
+}
+
+// upgradeSchema12to13 performs the following changes:
+//
+//	# BEFORE:
+//	'dns':
+//	  # …
+//	  'local_domain_name': 'lan'
+//
+//	# AFTER:
+//	'dhcp':
+//	  # …
+//	  'local_domain_name': 'lan'
+func upgradeSchema12to13(diskConf yobj) (err error) {
+	log.Printf("Upgrade yaml: 12 to 13")
+	diskConf["schema_version"] = 13
+
+	dnsVal, ok := diskConf["dns"]
+	if !ok {
+		return nil
+	}
+
+	var dns yobj
+	dns, ok = dnsVal.(yobj)
+	if !ok {
+		return fmt.Errorf("unexpected type of dns: %T", dnsVal)
+	}
+
+	dhcpVal, ok := diskConf["dhcp"]
+	if !ok {
+		return nil
+	}
+
+	var dhcp yobj
+	dhcp, ok = dhcpVal.(yobj)
+	if !ok {
+		return fmt.Errorf("unexpected type of dhcp: %T", dhcpVal)
+	}
+
+	const field = "local_domain_name"
+
+	dhcp[field] = dns[field]
+	delete(dns, field)
+
+	return nil
+}
+
+// upgradeSchema13to14 performs the following changes:
+//
+//	# BEFORE:
+//	'clients':
+//	- 'name': 'client-name'
+//	  # …
+//
+//	# AFTER:
+//	'clients':
+//	  'persistent':
+//	  - 'name': 'client-name'
+//	    # …
+//	  'runtime_sources':
+//	    'whois': true
+//	    'arp': true
+//	    'rdns': true
+//	    'dhcp': true
+//	    'hosts': true
+func upgradeSchema13to14(diskConf yobj) (err error) {
+	log.Printf("Upgrade yaml: 13 to 14")
+	diskConf["schema_version"] = 14
+
+	clientsVal, ok := diskConf["clients"]
+	if !ok {
+		clientsVal = yarr{}
+	}
+
+	var rdnsSrc bool
+	if dnsVal, dok := diskConf["dns"]; dok {
+		var dnsSettings yobj
+		dnsSettings, ok = dnsVal.(yobj)
+		if !ok {
+			return fmt.Errorf("unexpected type of dns: %T", dnsVal)
+		}
+
+		var rdnsSrcVal any
+		rdnsSrcVal, ok = dnsSettings["resolve_clients"]
+		if ok {
+			rdnsSrc, ok = rdnsSrcVal.(bool)
+			if !ok {
+				return fmt.Errorf("unexpected type of resolve_clients: %T", rdnsSrcVal)
+			}
+
+			delete(dnsSettings, "resolve_clients")
+		}
+	}
+
+	diskConf["clients"] = yobj{
+		"persistent": clientsVal,
+		"runtime_sources": &clientSourcesConfig{
+			WHOIS:     true,
+			ARP:       true,
+			RDNS:      rdnsSrc,
+			DHCP:      true,
+			HostsFile: true,
+		},
+	}
+
+	return nil
+}
+
+// upgradeSchema14to15 performs the following changes:
+//
+//	# BEFORE:
+//	'dns':
+//	  'querylog_enabled': true
+//	  'querylog_file_enabled': true
+//	  'querylog_interval': '2160h'
+//	  'querylog_size_memory': 1000
+//
+//	# AFTER:
+//	'querylog':
+//	  'enabled': true
+//	  'file_enabled': true
+//	  'interval': '2160h'
+//	  'size_memory': 1000
+//	  'ignored': []
+func upgradeSchema14to15(diskConf yobj) (err error) {
+	log.Printf("Upgrade yaml: 14 to 15")
+	diskConf["schema_version"] = 15
+
+	dnsVal, ok := diskConf["dns"]
+	if !ok {
+		return nil
+	}
+
+	dns, ok := dnsVal.(yobj)
+	if !ok {
+		return fmt.Errorf("unexpected type of dns: %T", dnsVal)
+	}
+
+	type temp struct {
+		val  any
+		from string
+		to   string
+	}
+	replaces := []temp{
+		{from: "querylog_enabled", to: "enabled", val: true},
+		{from: "querylog_file_enabled", to: "file_enabled", val: true},
+		{from: "querylog_interval", to: "interval", val: "2160h"},
+		{from: "querylog_size_memory", to: "size_memory", val: 1000},
+	}
+	qlog := map[string]any{
+		"ignored": []any{},
+	}
+	for _, r := range replaces {
+		v, has := dns[r.from]
+		if !has {
+			v = r.val
+		}
+		delete(dns, r.from)
+		qlog[r.to] = v
+	}
+	diskConf["querylog"] = qlog
+
+	return nil
+}
+
+// upgradeSchema15to16 performs the following changes:
+//
+//	# BEFORE:
+//	'dns':
+//	  'statistics_interval': 1
+//
+//	# AFTER:
+//	'statistics':
+//	  'enabled': true
+//	  'interval': 1
+//	  'ignored': []
+//
+// If statistics were disabled:
+//
+//	# BEFORE:
+//	'dns':
+//	  'statistics_interval': 0
+//
+//	# AFTER:
+//	'statistics':
+//	  'enabled': false
+//	  'interval': 1
+//	  'ignored': []
+func upgradeSchema15to16(diskConf yobj) (err error) {
+	log.Printf("Upgrade yaml: 15 to 16")
+	diskConf["schema_version"] = 16
+
+	dnsVal, ok := diskConf["dns"]
+	if !ok {
+		return nil
+	}
+
+	dns, ok := dnsVal.(yobj)
+	if !ok {
+		return fmt.Errorf("unexpected type of dns: %T", dnsVal)
+	}
+
+	stats := map[string]any{
+		"enabled":  true,
+		"interval": 1,
+		"ignored":  []any{},
+	}
+
+	const field = "statistics_interval"
+	statsIvlVal, has := dns[field]
+	if has {
+		var statsIvl int
+		statsIvl, ok = statsIvlVal.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type of dns.statistics_interval: %T", statsIvlVal)
+		}
+
+		if statsIvl == 0 {
+			// Set the interval to the default value of one day to make sure
+			// that it passes the validations.
+			stats["interval"] = 1
+			stats["enabled"] = false
+		} else {
+			stats["interval"] = statsIvl
+			stats["enabled"] = true
+		}
+	}
+	delete(dns, field)
+
+	diskConf["statistics"] = stats
+
+	return nil
+}
+
+// upgradeSchema16to17 performs the following changes:
+//
+//	# BEFORE:
+//	'dns':
+//	  'edns_client_subnet': false
+//
+//	# AFTER:
+//	'dns':
+//	  'edns_client_subnet':
+//	    'enabled': false
+//	    'use_custom': false
+//	    'custom_ip': ""
+func upgradeSchema16to17(diskConf yobj) (err error) {
+	log.Printf("Upgrade yaml: 16 to 17")
+	diskConf["schema_version"] = 17
+
+	dnsVal, ok := diskConf["dns"]
+	if !ok {
+		return nil
+	}
+
+	dns, ok := dnsVal.(yobj)
+	if !ok {
+		return fmt.Errorf("unexpected type of dns: %T", dnsVal)
+	}
+
+	const field = "edns_client_subnet"
+
+	dns[field] = map[string]any{
+		"enabled":    dns[field] == true,
+		"use_custom": false,
+		"custom_ip":  "",
+	}
+
+	return nil
+}
+
+// upgradeSchema17to18 performs the following changes:
+//
+//	# BEFORE:
+//	'dns':
+//	  'safesearch_enabled': true
+//
+//	# AFTER:
+//	'dns':
+//	  'safe_search':
+//	    'enabled': true
+//	    'bing': true
+//	    'duckduckgo': true
+//	    'google': true
+//	    'pixabay': true
+//	    'yandex': true
+//	    'youtube': true
+func upgradeSchema17to18(diskConf yobj) (err error) {
+	log.Printf("Upgrade yaml: 17 to 18")
+	diskConf["schema_version"] = 18
+
+	dnsVal, ok := diskConf["dns"]
+	if !ok {
+		return nil
+	}
+
+	dns, ok := dnsVal.(yobj)
+	if !ok {
+		return fmt.Errorf("unexpected type of dns: %T", dnsVal)
+	}
+
+	safeSearch := yobj{
+		"enabled":    true,
+		"bing":       true,
+		"duckduckgo": true,
+		"google":     true,
+		"pixabay":    true,
+		"yandex":     true,
+		"youtube":    true,
+	}
+
+	const safeSearchKey = "safesearch_enabled"
+
+	v, has := dns[safeSearchKey]
+	if has {
+		safeSearch["enabled"] = v
+	}
+	delete(dns, safeSearchKey)
+
+	dns["safe_search"] = safeSearch
+
+	return nil
+}
+
+// upgradeSchema18to19 performs the following changes:
+//
+//	# BEFORE:
+//	'clients':
+//	  'persistent':
+//	  - 'name': 'client-name'
+//	    'safesearch_enabled': true
+//
+//	# AFTER:
+//	'clients':
+//	  'persistent':
+//	  - 'name': 'client-name'
+//	    'safe_search':
+//	      'enabled': true
+//		  'bing': true
+//		  'duckduckgo': true
+//		  'google': true
+//		  'pixabay': true
+//		  'yandex': true
+//		  'youtube': true
+func upgradeSchema18to19(diskConf yobj) (err error) {
+	log.Printf("Upgrade yaml: 18 to 19")
+	diskConf["schema_version"] = 19
+
+	clientsVal, ok := diskConf["clients"]
+	if !ok {
+		return nil
+	}
+
+	clients, ok := clientsVal.(yobj)
+	if !ok {
+		return fmt.Errorf("unexpected type of clients: %T", clientsVal)
+	}
+
+	persistent, ok := clients["persistent"].([]yobj)
+	if !ok {
+		return nil
+	}
+
+	const safeSearchKey = "safesearch_enabled"
+
+	for i := range persistent {
+		c := persistent[i]
+
+		safeSearch := yobj{
+			"enabled":    true,
+			"bing":       true,
+			"duckduckgo": true,
+			"google":     true,
+			"pixabay":    true,
+			"yandex":     true,
+			"youtube":    true,
+		}
+
+		v, has := c[safeSearchKey]
+		if has {
+			safeSearch["enabled"] = v
+		}
+		delete(c, safeSearchKey)
+
+		c["safe_search"] = safeSearch
+	}
+
+	return nil
+}
+
+// upgradeSchema19to20 performs the following changes:
+//
+//	# BEFORE:
+//	'statistics':
+//	  'interval': 1
+//
+//	# AFTER:
+//	'statistics':
+//	  'interval': 24h
+func upgradeSchema19to20(diskConf yobj) (err error) {
+	log.Printf("Upgrade yaml: 19 to 20")
+	diskConf["schema_version"] = 20
+
+	statsVal, ok := diskConf["statistics"]
+	if !ok {
+		return nil
+	}
+
+	var stats yobj
+	stats, ok = statsVal.(yobj)
+	if !ok {
+		return fmt.Errorf("unexpected type of stats: %T", statsVal)
+	}
+
+	const field = "interval"
+
+	// Set the initial value from the global configuration structure.
+	statsIvl := 1
+	statsIvlVal, ok := stats[field]
+	if ok {
+		statsIvl, ok = statsIvlVal.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type of %s: %T", field, statsIvlVal)
+		}
+
+		// The initial version of upgradeSchema16to17 did not set the zero
+		// interval to a non-zero one.  So, reset it now.
+		if statsIvl == 0 {
+			statsIvl = 1
+		}
+	}
+
+	stats[field] = timeutil.Duration{Duration: time.Duration(statsIvl) * timeutil.Day}
 
 	return nil
 }

@@ -1,5 +1,4 @@
-//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
-// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
+//go:build freebsd || linux || openbsd
 
 package dhcpd
 
@@ -10,22 +9,23 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
 	"github.com/mdlayher/ethernet"
-	"github.com/mdlayher/raw"
+	"github.com/mdlayher/packet"
 )
 
 // dhcpUnicastAddr is the combination of MAC and IP addresses for responding to
 // the unconfigured host.
 type dhcpUnicastAddr struct {
-	// raw.Addr is embedded here to make *dhcpUcastAddr a net.Addr without
+	// packet.Addr is embedded here to make *dhcpUcastAddr a net.Addr without
 	// actually implementing all methods.  It also contains the client's
 	// hardware address.
-	raw.Addr
+	packet.Addr
 
 	// yiaddr is an IP address just allocated by server for the host.
 	yiaddr net.IP
@@ -49,16 +49,15 @@ type dhcpConn struct {
 }
 
 // newDHCPConn creates the special connection for DHCP server.
-func (s *v4Server) newDHCPConn(ifi *net.Interface) (c net.PacketConn, err error) {
-	// Create the raw connection.
+func (s *v4Server) newDHCPConn(iface *net.Interface) (c net.PacketConn, err error) {
 	var ucast net.PacketConn
-	if ucast, err = raw.ListenPacket(ifi, uint16(ethernet.EtherTypeIPv4), nil); err != nil {
+	if ucast, err = packet.Listen(iface, packet.Raw, int(ethernet.EtherTypeIPv4), nil); err != nil {
 		return nil, fmt.Errorf("creating raw udp connection: %w", err)
 	}
 
 	// Create the UDP connection.
 	var bcast net.PacketConn
-	bcast, err = server4.NewIPv4UDPConn(ifi.Name, &net.UDPAddr{
+	bcast, err = server4.NewIPv4UDPConn(iface.Name, &net.UDPAddr{
 		// TODO(e.burkov):  Listening on zeroes makes the server handle
 		// requests from all the interfaces.  Inspect the ways to
 		// specify the interface-specific listening addresses.
@@ -73,16 +72,16 @@ func (s *v4Server) newDHCPConn(ifi *net.Interface) (c net.PacketConn, err error)
 
 	return &dhcpConn{
 		udpConn: bcast,
-		bcastIP: s.conf.broadcastIP,
+		bcastIP: s.conf.broadcastIP.AsSlice(),
 		rawConn: ucast,
-		srcMAC:  ifi.HardwareAddr,
-		srcIP:   s.conf.dnsIPAddrs[0],
+		srcMAC:  iface.HardwareAddr,
+		srcIP:   s.conf.dnsIPAddrs[0].AsSlice(),
 	}, nil
 }
 
 // wrapErrs is a helper to wrap the errors from two independent underlying
 // connections.
-func (c *dhcpConn) wrapErrs(action string, udpConnErr, rawConnErr error) (err error) {
+func (*dhcpConn) wrapErrs(action string, udpConnErr, rawConnErr error) (err error) {
 	switch {
 	case udpConnErr != nil && rawConnErr != nil:
 		return errors.List(fmt.Sprintf("%s both connections", action), udpConnErr, rawConnErr)
@@ -128,7 +127,7 @@ func (c *dhcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		// connection.
 		return c.udpConn.WriteTo(p, addr)
 	default:
-		return 0, fmt.Errorf("peer is of unexpected type %T", addr)
+		return 0, fmt.Errorf("addr has an unexpected type %T", addr)
 	}
 }
 
@@ -187,32 +186,20 @@ func (c *dhcpConn) SetWriteDeadline(t time.Time) error {
 	)
 }
 
-// ipv4DefaultTTL is the default Time to Live value as recommended by
-// RFC-1700 (https://datatracker.ietf.org/doc/html/rfc1700) in seconds.
+// ipv4DefaultTTL is the default Time to Live value in seconds as recommended by
+// RFC-1700.
+//
+// See https://datatracker.ietf.org/doc/html/rfc1700.
 const ipv4DefaultTTL = 64
 
-// errInvalidPktDHCP is returned when the provided payload is not a valid DHCP
-// packet.
-const errInvalidPktDHCP errors.Error = "packet is not a valid dhcp packet"
-
-// buildEtherPkt wraps the payload with IPv4, UDP and Ethernet frames.  The
-// payload is expected to be an encoded DHCP packet.
+// buildEtherPkt wraps the payload with IPv4, UDP and Ethernet frames.
+// Validation of the payload is a caller's responsibility.
 func (c *dhcpConn) buildEtherPkt(payload []byte, peer *dhcpUnicastAddr) (pkt []byte, err error) {
-	dhcpLayer := gopacket.NewPacket(payload, layers.LayerTypeDHCPv4, gopacket.DecodeOptions{
-		NoCopy: true,
-	}).Layer(layers.LayerTypeDHCPv4)
-
-	// Check if the decoding succeeded and the resulting layer doesn't
-	// contain any errors.  It should guarantee panic-safe converting of the
-	// layer into gopacket.SerializableLayer.
-	if dhcpLayer == nil || dhcpLayer.LayerType() != layers.LayerTypeDHCPv4 {
-		return nil, errInvalidPktDHCP
-	}
-
 	udpLayer := &layers.UDP{
 		SrcPort: dhcpv4.ServerPort,
 		DstPort: dhcpv4.ClientPort,
 	}
+
 	ipv4Layer := &layers.IPv4{
 		Version:  uint8(layers.IPProtocolIPv4),
 		Flags:    layers.IPv4DontFragment,
@@ -225,6 +212,7 @@ func (c *dhcpConn) buildEtherPkt(payload []byte, peer *dhcpUnicastAddr) (pkt []b
 	// Ignore the error since it's only returned for invalid network layer's
 	// type.
 	_ = udpLayer.SetNetworkLayerForChecksum(ipv4Layer)
+
 	ethLayer := &layers.Ethernet{
 		SrcMAC:       c.srcMAC,
 		DstMAC:       peer.HardwareAddr,
@@ -232,13 +220,72 @@ func (c *dhcpConn) buildEtherPkt(payload []byte, peer *dhcpUnicastAddr) (pkt []b
 	}
 
 	buf := gopacket.NewSerializeBuffer()
-	err = gopacket.SerializeLayers(buf, gopacket.SerializeOptions{
+	setts := gopacket.SerializeOptions{
 		FixLengths:       true,
 		ComputeChecksums: true,
-	}, ethLayer, ipv4Layer, udpLayer, dhcpLayer.(gopacket.SerializableLayer))
+	}
+
+	err = gopacket.SerializeLayers(
+		buf,
+		setts,
+		ethLayer,
+		ipv4Layer,
+		udpLayer,
+		gopacket.Payload(payload),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("serializing layers: %w", err)
 	}
 
 	return buf.Bytes(), nil
+}
+
+// send writes resp for peer to conn considering the req's parameters according
+// to RFC-2131.
+//
+// See https://datatracker.ietf.org/doc/html/rfc2131#section-4.1.
+func (s *v4Server) send(peer net.Addr, conn net.PacketConn, req, resp *dhcpv4.DHCPv4) {
+	switch giaddr, ciaddr, mtype := req.GatewayIPAddr, req.ClientIPAddr, resp.MessageType(); {
+	case giaddr != nil && !giaddr.IsUnspecified():
+		// Send any return messages to the server port on the BOOTP
+		// relay agent whose address appears in giaddr.
+		peer = &net.UDPAddr{
+			IP:   giaddr,
+			Port: dhcpv4.ServerPort,
+		}
+		if mtype == dhcpv4.MessageTypeNak {
+			// Set the broadcast bit in the DHCPNAK, so that the relay agent
+			// broadcasts it to the client, because the client may not have
+			// a correct network address or subnet mask, and the client may not
+			// be answering ARP requests.
+			resp.SetBroadcast()
+		}
+	case mtype == dhcpv4.MessageTypeNak:
+		// Broadcast any DHCPNAK messages to 0xffffffff.
+	case ciaddr != nil && !ciaddr.IsUnspecified():
+		// Unicast DHCPOFFER and DHCPACK messages to the address in
+		// ciaddr.
+		peer = &net.UDPAddr{
+			IP:   ciaddr,
+			Port: dhcpv4.ClientPort,
+		}
+	case !req.IsBroadcast() && req.ClientHWAddr != nil:
+		// Unicast DHCPOFFER and DHCPACK messages to the client's
+		// hardware address and yiaddr.
+		peer = &dhcpUnicastAddr{
+			Addr:   packet.Addr{HardwareAddr: req.ClientHWAddr},
+			yiaddr: resp.YourIPAddr,
+		}
+	default:
+		// Go on since peer is already set to broadcast.
+	}
+
+	pktData := resp.ToBytes()
+
+	log.Debug("dhcpv4: sending %d bytes to %s: %s", len(pktData), peer, resp.Summary())
+
+	_, err := conn.WriteTo(pktData, peer)
+	if err != nil {
+		log.Error("dhcpv4: conn.Write to %s failed: %s", peer, err)
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/AdguardTeam/golibs/timeutil"
 	"github.com/stretchr/testify/assert"
@@ -55,7 +56,7 @@ func TestUpgradeSchema2to3(t *testing.T) {
 		require.Len(t, v, 1)
 		require.Equal(t, "8.8.8.8:53", v[0])
 	default:
-		t.Fatalf("wrong type for bootsrap dns: %T", v)
+		t.Fatalf("wrong type for bootstrap dns: %T", v)
 	}
 
 	excludedEntries := []string{"bootstrap_dns"}
@@ -160,7 +161,7 @@ func assertEqualExcept(t *testing.T, oldConf, newConf yobj, oldKeys, newKeys []s
 }
 
 func testDiskConf(schemaVersion int) (diskConf yobj) {
-	filters := []filter{{
+	filters := []filtering.FilterYAML{{
 		URL:        "https://filters.adtidy.org/android/filters/111_optimized.txt",
 		Name:       "Latvian filter",
 		RulesCount: 100,
@@ -190,7 +191,7 @@ func testDiskConf(schemaVersion int) (diskConf yobj) {
 	return diskConf
 }
 
-// testDNSConf creates a DNS config for test the way gopkg.in/yaml.v2 would
+// testDNSConf creates a DNS config for test the way gopkg.in/yaml.v3 would
 // unmarshal it.  In YAML, keys aren't guaranteed to always only be strings.
 func testDNSConf(schemaVersion int) (dnsConf yobj) {
 	dnsConf = yobj{
@@ -500,7 +501,7 @@ func TestUpgradeSchema11to12(t *testing.T) {
 		dnsVal, ok = dns.(yobj)
 		require.True(t, ok)
 
-		var ivl interface{}
+		var ivl any
 		ivl, ok = dnsVal["querylog_interval"]
 		require.True(t, ok)
 
@@ -509,5 +510,544 @@ func TestUpgradeSchema11to12(t *testing.T) {
 		require.True(t, ok)
 
 		assert.Equal(t, 90*24*time.Hour, ivlVal.Duration)
+	})
+}
+
+func TestUpgradeSchema12to13(t *testing.T) {
+	const newSchemaVer = 13
+
+	testCases := []struct {
+		in   yobj
+		want yobj
+		name string
+	}{{
+		in:   yobj{},
+		want: yobj{"schema_version": newSchemaVer},
+		name: "no_dns",
+	}, {
+		in: yobj{"dns": yobj{}},
+		want: yobj{
+			"dns":            yobj{},
+			"schema_version": newSchemaVer,
+		},
+		name: "no_dhcp",
+	}, {
+		in: yobj{
+			"dns": yobj{
+				"local_domain_name": "lan",
+			},
+			"dhcp":           yobj{},
+			"schema_version": newSchemaVer - 1,
+		},
+		want: yobj{
+			"dns": yobj{},
+			"dhcp": yobj{
+				"local_domain_name": "lan",
+			},
+			"schema_version": newSchemaVer,
+		},
+		name: "good",
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := upgradeSchema12to13(tc.in)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.want, tc.in)
+		})
+	}
+}
+
+func TestUpgradeSchema13to14(t *testing.T) {
+	const newSchemaVer = 14
+
+	testClient := &clientObject{
+		Name:              "agh-client",
+		IDs:               []string{"id1"},
+		UseGlobalSettings: true,
+	}
+
+	testCases := []struct {
+		in   yobj
+		want yobj
+		name string
+	}{{
+		in: yobj{},
+		want: yobj{
+			"schema_version": newSchemaVer,
+			// The clients field will be added anyway.
+			"clients": yobj{
+				"persistent": yarr{},
+				"runtime_sources": &clientSourcesConfig{
+					WHOIS:     true,
+					ARP:       true,
+					RDNS:      false,
+					DHCP:      true,
+					HostsFile: true,
+				},
+			},
+		},
+		name: "no_clients",
+	}, {
+		in: yobj{
+			"clients": []*clientObject{testClient},
+		},
+		want: yobj{
+			"schema_version": newSchemaVer,
+			"clients": yobj{
+				"persistent": []*clientObject{testClient},
+				"runtime_sources": &clientSourcesConfig{
+					WHOIS:     true,
+					ARP:       true,
+					RDNS:      false,
+					DHCP:      true,
+					HostsFile: true,
+				},
+			},
+		},
+		name: "no_dns",
+	}, {
+		in: yobj{
+			"clients": []*clientObject{testClient},
+			"dns": yobj{
+				"resolve_clients": true,
+			},
+		},
+		want: yobj{
+			"schema_version": newSchemaVer,
+			"clients": yobj{
+				"persistent": []*clientObject{testClient},
+				"runtime_sources": &clientSourcesConfig{
+					WHOIS:     true,
+					ARP:       true,
+					RDNS:      true,
+					DHCP:      true,
+					HostsFile: true,
+				},
+			},
+			"dns": yobj{},
+		},
+		name: "good",
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := upgradeSchema13to14(tc.in)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.want, tc.in)
+		})
+	}
+}
+
+func TestUpgradeSchema14to15(t *testing.T) {
+	const newSchemaVer = 15
+
+	defaultWantObj := yobj{
+		"querylog": map[string]any{
+			"enabled":      true,
+			"file_enabled": true,
+			"interval":     "2160h",
+			"size_memory":  1000,
+			"ignored":      []any{},
+		},
+		"dns":            map[string]any{},
+		"schema_version": newSchemaVer,
+	}
+
+	testCases := []struct {
+		in   yobj
+		want yobj
+		name string
+	}{{
+		in: yobj{
+			"dns": map[string]any{
+				"querylog_enabled":      true,
+				"querylog_file_enabled": true,
+				"querylog_interval":     "2160h",
+				"querylog_size_memory":  1000,
+			},
+		},
+		want: defaultWantObj,
+		name: "basic",
+	}, {
+		in: yobj{
+			"dns": map[string]any{},
+		},
+		want: defaultWantObj,
+		name: "default_values",
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := upgradeSchema14to15(tc.in)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.want, tc.in)
+		})
+	}
+}
+
+func TestUpgradeSchema15to16(t *testing.T) {
+	const newSchemaVer = 16
+
+	defaultWantObj := yobj{
+		"statistics": map[string]any{
+			"enabled":  true,
+			"interval": 1,
+			"ignored":  []any{},
+		},
+		"dns":            map[string]any{},
+		"schema_version": newSchemaVer,
+	}
+
+	testCases := []struct {
+		in   yobj
+		want yobj
+		name string
+	}{{
+		in: yobj{
+			"dns": map[string]any{
+				"statistics_interval": 1,
+			},
+		},
+		want: defaultWantObj,
+		name: "basic",
+	}, {
+		in: yobj{
+			"dns": map[string]any{},
+		},
+		want: defaultWantObj,
+		name: "default_values",
+	}, {
+		in: yobj{
+			"dns": map[string]any{
+				"statistics_interval": 0,
+			},
+		},
+		want: yobj{
+			"statistics": map[string]any{
+				"enabled":  false,
+				"interval": 1,
+				"ignored":  []any{},
+			},
+			"dns":            map[string]any{},
+			"schema_version": newSchemaVer,
+		},
+		name: "stats_disabled",
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := upgradeSchema15to16(tc.in)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.want, tc.in)
+		})
+	}
+}
+
+func TestUpgradeSchema16to17(t *testing.T) {
+	const newSchemaVer = 17
+
+	defaultWantObj := yobj{
+		"dns": map[string]any{
+			"edns_client_subnet": map[string]any{
+				"enabled":    false,
+				"use_custom": false,
+				"custom_ip":  "",
+			},
+		},
+		"schema_version": newSchemaVer,
+	}
+
+	testCases := []struct {
+		in   yobj
+		want yobj
+		name string
+	}{{
+		in: yobj{
+			"dns": map[string]any{
+				"edns_client_subnet": false,
+			},
+		},
+		want: defaultWantObj,
+		name: "basic",
+	}, {
+		in: yobj{
+			"dns": map[string]any{},
+		},
+		want: defaultWantObj,
+		name: "default_values",
+	}, {
+		in: yobj{
+			"dns": map[string]any{
+				"edns_client_subnet": true,
+			},
+		},
+		want: yobj{
+			"dns": map[string]any{
+				"edns_client_subnet": map[string]any{
+					"enabled":    true,
+					"use_custom": false,
+					"custom_ip":  "",
+				},
+			},
+			"schema_version": newSchemaVer,
+		},
+		name: "is_true",
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := upgradeSchema16to17(tc.in)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.want, tc.in)
+		})
+	}
+}
+
+func TestUpgradeSchema17to18(t *testing.T) {
+	const newSchemaVer = 18
+
+	defaultWantObj := yobj{
+		"dns": yobj{
+			"safe_search": yobj{
+				"enabled":    true,
+				"bing":       true,
+				"duckduckgo": true,
+				"google":     true,
+				"pixabay":    true,
+				"yandex":     true,
+				"youtube":    true,
+			},
+		},
+		"schema_version": newSchemaVer,
+	}
+
+	testCases := []struct {
+		in   yobj
+		want yobj
+		name string
+	}{{
+		in:   yobj{"dns": yobj{}},
+		want: defaultWantObj,
+		name: "default_values",
+	}, {
+		in:   yobj{"dns": yobj{"safesearch_enabled": true}},
+		want: defaultWantObj,
+		name: "enabled",
+	}, {
+		in: yobj{"dns": yobj{"safesearch_enabled": false}},
+		want: yobj{
+			"dns": yobj{
+				"safe_search": map[string]any{
+					"enabled":    false,
+					"bing":       true,
+					"duckduckgo": true,
+					"google":     true,
+					"pixabay":    true,
+					"yandex":     true,
+					"youtube":    true,
+				},
+			},
+			"schema_version": newSchemaVer,
+		},
+		name: "disabled",
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := upgradeSchema17to18(tc.in)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.want, tc.in)
+		})
+	}
+}
+
+func TestUpgradeSchema18to19(t *testing.T) {
+	const newSchemaVer = 19
+
+	defaultWantObj := yobj{
+		"clients": yobj{
+			"persistent": []yobj{{
+				"name": "localhost",
+				"safe_search": yobj{
+					"enabled":    true,
+					"bing":       true,
+					"duckduckgo": true,
+					"google":     true,
+					"pixabay":    true,
+					"yandex":     true,
+					"youtube":    true,
+				},
+			}},
+		},
+		"schema_version": newSchemaVer,
+	}
+
+	testCases := []struct {
+		in   yobj
+		want yobj
+		name string
+	}{{
+		in: yobj{
+			"clients": yobj{},
+		},
+		want: yobj{
+			"clients":        yobj{},
+			"schema_version": newSchemaVer,
+		},
+		name: "no_clients",
+	}, {
+		in: yobj{
+			"clients": yobj{
+				"persistent": []yobj{{"name": "localhost"}},
+			},
+		},
+		want: defaultWantObj,
+		name: "default_values",
+	}, {
+		in: yobj{
+			"clients": yobj{
+				"persistent": []yobj{{"name": "localhost", "safesearch_enabled": true}},
+			},
+		},
+		want: defaultWantObj,
+		name: "enabled",
+	}, {
+		in: yobj{
+			"clients": yobj{
+				"persistent": []yobj{{"name": "localhost", "safesearch_enabled": false}},
+			},
+		},
+		want: yobj{
+			"clients": yobj{"persistent": []yobj{{
+				"name": "localhost",
+				"safe_search": yobj{
+					"enabled":    false,
+					"bing":       true,
+					"duckduckgo": true,
+					"google":     true,
+					"pixabay":    true,
+					"yandex":     true,
+					"youtube":    true,
+				},
+			}}},
+			"schema_version": newSchemaVer,
+		},
+		name: "disabled",
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := upgradeSchema18to19(tc.in)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.want, tc.in)
+		})
+	}
+}
+
+func TestUpgradeSchema19to20(t *testing.T) {
+	testCases := []struct {
+		ivl     any
+		want    any
+		wantErr string
+		name    string
+	}{{
+		ivl:     1,
+		want:    timeutil.Duration{Duration: timeutil.Day},
+		wantErr: "",
+		name:    "success",
+	}, {
+		ivl:     0,
+		want:    timeutil.Duration{Duration: timeutil.Day},
+		wantErr: "",
+		name:    "success",
+	}, {
+		ivl:     0.25,
+		want:    0,
+		wantErr: "unexpected type of interval: float64",
+		name:    "fail",
+	}}
+
+	for _, tc := range testCases {
+		conf := yobj{
+			"statistics": yobj{
+				"interval": tc.ivl,
+			},
+			"schema_version": 19,
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			err := upgradeSchema19to20(conf)
+
+			if tc.wantErr != "" {
+				require.Error(t, err)
+
+				assert.Equal(t, tc.wantErr, err.Error())
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, conf["schema_version"], 20)
+
+			statsVal, ok := conf["statistics"]
+			require.True(t, ok)
+
+			var stats yobj
+			stats, ok = statsVal.(yobj)
+			require.True(t, ok)
+
+			var newIvl timeutil.Duration
+			newIvl, ok = stats["interval"].(timeutil.Duration)
+			require.True(t, ok)
+
+			assert.Equal(t, tc.want, newIvl)
+		})
+	}
+
+	t.Run("no_stats", func(t *testing.T) {
+		err := upgradeSchema19to20(yobj{})
+
+		assert.NoError(t, err)
+	})
+
+	t.Run("bad_stats", func(t *testing.T) {
+		err := upgradeSchema19to20(yobj{
+			"statistics": 0,
+		})
+
+		testutil.AssertErrorMsg(t, "unexpected type of stats: int", err)
+	})
+
+	t.Run("no_field", func(t *testing.T) {
+		conf := yobj{
+			"statistics": yobj{},
+		}
+
+		err := upgradeSchema19to20(conf)
+		require.NoError(t, err)
+
+		statsVal, ok := conf["statistics"]
+		require.True(t, ok)
+
+		var stats yobj
+		stats, ok = statsVal.(yobj)
+		require.True(t, ok)
+
+		var ivl any
+		ivl, ok = stats["interval"]
+		require.True(t, ok)
+
+		var ivlVal timeutil.Duration
+		ivlVal, ok = ivl.(timeutil.Duration)
+		require.True(t, ok)
+
+		assert.Equal(t, 24*time.Hour, ivlVal.Duration)
 	})
 }

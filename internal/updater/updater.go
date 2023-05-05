@@ -82,8 +82,9 @@ type Config struct {
 func NewUpdater(conf *Config) *Updater {
 	u := &url.URL{
 		Scheme: "https",
-		Host:   "static.adguard.com",
-		Path:   path.Join("adguardhome", conf.Channel, "version.json"),
+		// TODO(a.garipov): Make configurable.
+		Host: "static.adtidy.org",
+		Path: path.Join("adguardhome", conf.Channel, "version.json"),
 	}
 	return &Updater{
 		client: conf.Client,
@@ -103,41 +104,58 @@ func NewUpdater(conf *Config) *Updater {
 	}
 }
 
-// Update performs the auto-update.
-func (u *Updater) Update() error {
+// Update performs the auto-update.  It returns an error if the update failed.
+// If firstRun is true, it assumes the configuration file doesn't exist.
+func (u *Updater) Update(firstRun bool) (err error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
-	err := u.prepare()
+	log.Info("updater: updating")
+	defer func() {
+		if err != nil {
+			log.Error("updater: failed: %v", err)
+		} else {
+			log.Info("updater: finished")
+		}
+	}()
+
+	execPath, err := os.Executable()
 	if err != nil {
-		return err
+		return fmt.Errorf("getting executable path: %w", err)
+	}
+
+	err = u.prepare(execPath)
+	if err != nil {
+		return fmt.Errorf("preparing: %w", err)
 	}
 
 	defer u.clean()
 
-	err = u.downloadPackageFile(u.packageURL, u.packageName)
+	err = u.downloadPackageFile()
 	if err != nil {
-		return err
+		return fmt.Errorf("downloading package file: %w", err)
 	}
 
 	err = u.unpack()
 	if err != nil {
-		return err
+		return fmt.Errorf("unpacking: %w", err)
 	}
 
-	err = u.check()
-	if err != nil {
-		return err
+	if !firstRun {
+		err = u.check()
+		if err != nil {
+			return fmt.Errorf("checking config: %w", err)
+		}
 	}
 
-	err = u.backup()
+	err = u.backup(firstRun)
 	if err != nil {
-		return err
+		return fmt.Errorf("making backup: %w", err)
 	}
 
 	err = u.replace()
 	if err != nil {
-		return err
+		return fmt.Errorf("replacing: %w", err)
 	}
 
 	return nil
@@ -159,29 +177,34 @@ func (u *Updater) VersionCheckURL() (vcu string) {
 	return u.versionCheckURL
 }
 
-func (u *Updater) prepare() (err error) {
+// prepare fills all necessary fields in Updater object.
+func (u *Updater) prepare(exePath string) (err error) {
 	u.updateDir = filepath.Join(u.workDir, fmt.Sprintf("agh-update-%s", u.newVersion))
 
 	_, pkgNameOnly := filepath.Split(u.packageURL)
 	if pkgNameOnly == "" {
-		return fmt.Errorf("invalid PackageURL")
+		return fmt.Errorf("invalid PackageURL: %q", u.packageURL)
 	}
 
 	u.packageName = filepath.Join(u.updateDir, pkgNameOnly)
 	u.backupDir = filepath.Join(u.workDir, "agh-backup")
 
-	exeName := "AdGuardHome"
+	updateExeName := "AdGuardHome"
 	if u.goos == "windows" {
-		exeName = "AdGuardHome.exe"
+		updateExeName = "AdGuardHome.exe"
 	}
 
-	u.backupExeName = filepath.Join(u.backupDir, exeName)
-	u.updateExeName = filepath.Join(u.updateDir, exeName)
+	u.backupExeName = filepath.Join(u.backupDir, filepath.Base(exePath))
+	u.updateExeName = filepath.Join(u.updateDir, updateExeName)
 
-	log.Info("Updating from %s to %s.  URL:%s", version.Version(), u.newVersion, u.packageURL)
+	log.Debug(
+		"updater: updating from %s to %s using url: %s",
+		version.Version(),
+		u.newVersion,
+		u.packageURL,
+	)
 
-	// TODO(a.garipov): Use os.Args[0] instead?
-	u.currentExeName = filepath.Join(u.workDir, exeName)
+	u.currentExeName = exePath
 	_, err = os.Stat(u.currentExeName)
 	if err != nil {
 		return fmt.Errorf("checking %q: %w", u.currentExeName, err)
@@ -190,11 +213,12 @@ func (u *Updater) prepare() (err error) {
 	return nil
 }
 
+// unpack extracts the files from the downloaded archive.
 func (u *Updater) unpack() error {
 	var err error
 	_, pkgNameOnly := filepath.Split(u.packageURL)
 
-	log.Debug("updater: unpacking the package")
+	log.Debug("updater: unpacking package")
 	if strings.HasSuffix(pkgNameOnly, ".zip") {
 		u.unpackedFiles, err = zipFileUnpack(u.packageName, u.updateDir)
 		if err != nil {
@@ -214,45 +238,55 @@ func (u *Updater) unpack() error {
 	return nil
 }
 
+// check returns an error if the configuration file couldn't be used with the
+// version of AdGuard Home just downloaded.
 func (u *Updater) check() error {
 	log.Debug("updater: checking configuration")
+
 	err := copyFile(u.confName, filepath.Join(u.updateDir, "AdGuardHome.yaml"))
 	if err != nil {
 		return fmt.Errorf("copyFile() failed: %w", err)
 	}
+
 	cmd := exec.Command(u.updateExeName, "--check-config")
 	err = cmd.Run()
 	if err != nil || cmd.ProcessState.ExitCode() != 0 {
 		return fmt.Errorf("exec.Command(): %s %d", err, cmd.ProcessState.ExitCode())
 	}
+
 	return nil
 }
 
-func (u *Updater) backup() error {
-	log.Debug("updater: backing up the current configuration")
+// backup makes a backup of the current configuration and supporting files.  It
+// ignores the configuration file if firstRun is true.
+func (u *Updater) backup(firstRun bool) (err error) {
+	log.Debug("updater: backing up current configuration")
 	_ = os.Mkdir(u.backupDir, 0o755)
-	err := copyFile(u.confName, filepath.Join(u.backupDir, "AdGuardHome.yaml"))
-	if err != nil {
-		return fmt.Errorf("copyFile() failed: %w", err)
+	if !firstRun {
+		err = copyFile(u.confName, filepath.Join(u.backupDir, "AdGuardHome.yaml"))
+		if err != nil {
+			return fmt.Errorf("copyFile() failed: %w", err)
+		}
 	}
 
 	wd := u.workDir
 	err = copySupportingFiles(u.unpackedFiles, wd, u.backupDir)
 	if err != nil {
-		return fmt.Errorf("copySupportingFiles(%s, %s) failed: %s",
-			wd, u.backupDir, err)
+		return fmt.Errorf("copySupportingFiles(%s, %s) failed: %w", wd, u.backupDir, err)
 	}
 
 	return nil
 }
 
+// replace moves the current executable with the updated one and also copies the
+// supporting files.
 func (u *Updater) replace() error {
 	err := copySupportingFiles(u.unpackedFiles, u.updateDir, u.workDir)
 	if err != nil {
-		return fmt.Errorf("copySupportingFiles(%s, %s) failed: %s", u.updateDir, u.workDir, err)
+		return fmt.Errorf("copySupportingFiles(%s, %s) failed: %w", u.updateDir, u.workDir, err)
 	}
 
-	log.Debug("updater: renaming: %s -> %s", u.currentExeName, u.backupExeName)
+	log.Debug("updater: renaming: %s to %s", u.currentExeName, u.backupExeName)
 	err = os.Rename(u.currentExeName, u.backupExeName)
 	if err != nil {
 		return err
@@ -268,11 +302,12 @@ func (u *Updater) replace() error {
 		return err
 	}
 
-	log.Debug("updater: renamed: %s -> %s", u.updateExeName, u.currentExeName)
+	log.Debug("updater: renamed: %s to %s", u.updateExeName, u.currentExeName)
 
 	return nil
 }
 
+// clean removes the temporary directory itself and all it's contents.
 func (u *Updater) clean() {
 	_ = os.RemoveAll(u.updateDir)
 }
@@ -283,9 +318,9 @@ func (u *Updater) clean() {
 const MaxPackageFileSize = 32 * 1024 * 1024
 
 // Download package file and save it to disk
-func (u *Updater) downloadPackageFile(url, filename string) (err error) {
+func (u *Updater) downloadPackageFile() (err error) {
 	var resp *http.Response
-	resp, err = u.client.Get(url)
+	resp, err = u.client.Get(u.packageURL)
 	if err != nil {
 		return fmt.Errorf("http request failed: %w", err)
 	}
@@ -297,7 +332,7 @@ func (u *Updater) downloadPackageFile(url, filename string) (err error) {
 		return fmt.Errorf("http request failed: %w", err)
 	}
 
-	log.Debug("updater: reading HTTP body")
+	log.Debug("updater: reading http body")
 	// This use of ReadAll is now safe, because we limited body's Reader.
 	body, err := io.ReadAll(r)
 	if err != nil {
@@ -307,7 +342,7 @@ func (u *Updater) downloadPackageFile(url, filename string) (err error) {
 	_ = os.Mkdir(u.updateDir, 0o755)
 
 	log.Debug("updater: saving package to file")
-	err = os.WriteFile(filename, body, 0o644)
+	err = os.WriteFile(u.packageName, body, 0o644)
 	if err != nil {
 		return fmt.Errorf("os.WriteFile() failed: %w", err)
 	}
@@ -343,7 +378,7 @@ func tarGzFileUnpackOne(outDir string, tr *tar.Reader, hdr *tar.Header) (name st
 	}
 
 	if hdr.Typeflag != tar.TypeReg {
-		log.Debug("updater: %s: unknown file type %d, skipping", name, hdr.Typeflag)
+		log.Info("updater: %s: unknown file type %d, skipping", name, hdr.Typeflag)
 
 		return "", nil
 	}
@@ -364,7 +399,7 @@ func tarGzFileUnpackOne(outDir string, tr *tar.Reader, hdr *tar.Header) (name st
 		return "", fmt.Errorf("io.Copy(): %w", err)
 	}
 
-	log.Tracef("updater: created file %s", outputName)
+	log.Debug("updater: created file %q", outputName)
 
 	return name, nil
 }
@@ -440,7 +475,7 @@ func zipFileUnpackOne(outDir string, zf *zip.File) (name string, err error) {
 			return "", fmt.Errorf("os.Mkdir(%q): %w", outputName, err)
 		}
 
-		log.Tracef("created directory %q", outputName)
+		log.Debug("updater: created directory %q", outputName)
 
 		return "", nil
 	}
@@ -457,7 +492,7 @@ func zipFileUnpackOne(outDir string, zf *zip.File) (name string, err error) {
 		return "", fmt.Errorf("io.Copy(): %w", err)
 	}
 
-	log.Tracef("created file %s", outputName)
+	log.Debug("updater: created file %q", outputName)
 
 	return name, nil
 }
@@ -516,7 +551,7 @@ func copySupportingFiles(files []string, srcdir, dstdir string) error {
 			return err
 		}
 
-		log.Debug("updater: copied: %q -> %q", src, dst)
+		log.Debug("updater: copied: %q to %q", src, dst)
 	}
 
 	return nil

@@ -50,6 +50,11 @@ readonly docker_image_name
 
 # Set DOCKER_OUTPUT to 'type=image,name=adguard/adguard-home,push=true' if you
 # want (and are allowed) to push to DockerHub.
+#
+# If you want to inspect the resulting image using commands like "docker image
+# ls", change type to docker and also set docker_platforms to a single platform.
+#
+# See https://github.com/docker/buildx/issues/166.
 docker_output="${DOCKER_OUTPUT:-type=image,name=${docker_image_name},push=false}"
 readonly docker_output
 
@@ -80,9 +85,9 @@ in
 esac
 readonly docker_image_full_name docker_tags
 
-# Copy the binaries into a new directory under new names, so that it's eaiser to
+# Copy the binaries into a new directory under new names, so that it's easier to
 # COPY them later.  DO NOT remove the trailing underscores.  See file
-# scripts/make/Dockerfile.
+# docker/Dockerfile.
 dist_docker="${dist_dir}/docker"
 readonly dist_docker
 
@@ -100,6 +105,18 @@ cp "${dist_dir}/AdGuardHome_linux_arm_7/AdGuardHome/AdGuardHome"\
 cp "${dist_dir}/AdGuardHome_linux_ppc64le/AdGuardHome/AdGuardHome"\
 	"${dist_docker}/AdGuardHome_linux_ppc64le_"
 
+# Copy the helper scripts.  See file docker/Dockerfile.
+dist_docker_scripts="${dist_docker}/scripts"
+readonly dist_docker_scripts
+
+mkdir -p "$dist_docker_scripts"
+cp "./docker/dns-bind.awk"\
+	"${dist_docker_scripts}/dns-bind.awk"
+cp "./docker/web-bind.awk"\
+	"${dist_docker_scripts}/web-bind.awk"
+cp "./docker/healthcheck.sh"\
+	"${dist_docker_scripts}/healthcheck.sh"
+
 # Don't use quotes with $docker_tags and $debug_flags because we want word
 # splitting and or an empty space if tags are empty.
 $sudo_cmd docker\
@@ -113,5 +130,5 @@ $sudo_cmd docker\
 	--platform "$docker_platforms"\
 	$docker_tags\
 	-t "$docker_image_full_name"\
-	-f ./scripts/make/Dockerfile\
+	-f ./docker/Dockerfile\
 	.

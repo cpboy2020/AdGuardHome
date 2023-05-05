@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/dhcpd"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
@@ -28,15 +31,10 @@ import (
 // DefaultTimeout is the default upstream timeout
 const DefaultTimeout = 10 * time.Second
 
-// defaultClientIDCacheCount is the default count of items in the LRU client ID
+// defaultClientIDCacheCount is the default count of items in the LRU ClientID
 // cache.  The assumption here is that there won't be more than this many
 // requests between the BeforeRequestHandler stage and the actual processing.
 const defaultClientIDCacheCount = 1024
-
-const (
-	safeBrowsingBlockHost = "standard-block.dns.adguard.com"
-	parentalBlockHost     = "family-block.dns.adguard.com"
-)
 
 var defaultDNS = []string{
 	"https://dns10.quad9.net/dns-query",
@@ -48,45 +46,64 @@ var defaultBlockedHosts = []string{"version.bind", "id.server", "hostname.bind"}
 
 var webRegistered bool
 
-// hostToIPTable is an alias for the type of Server.tableHostToIP.
-type hostToIPTable = map[string]net.IP
+// hostToIPTable is a convenient type alias for tables of host names to an IP
+// address.
+type hostToIPTable = map[string]netip.Addr
+
+// ipToHostTable is a convenient type alias for tables of IP addresses to their
+// host names.  For example, for use with PTR queries.
+type ipToHostTable = map[netip.Addr]string
 
 // Server is the main way to start a DNS server.
 //
 // Example:
-//  s := dnsforward.Server{}
-//  err := s.Start(nil) // will start a DNS server listening on default port 53, in a goroutine
-//  err := s.Reconfigure(ServerConfig{UDPListenAddr: &net.UDPAddr{Port: 53535}}) // will reconfigure running DNS server to listen on UDP port 53535
-//  err := s.Stop() // will stop listening on port 53535 and cancel all goroutines
-//  err := s.Start(nil) // will start listening again, on port 53535, in a goroutine
+//
+//	s := dnsforward.Server{}
+//	err := s.Start(nil) // will start a DNS server listening on default port 53, in a goroutine
+//	err := s.Reconfigure(ServerConfig{UDPListenAddr: &net.UDPAddr{Port: 53535}}) // will reconfigure running DNS server to listen on UDP port 53535
+//	err := s.Stop() // will stop listening on port 53535 and cancel all goroutines
+//	err := s.Start(nil) // will start listening again, on port 53535, in a goroutine
 //
 // The zero Server is empty and ready for use.
 type Server struct {
-	dnsProxy   *proxy.Proxy          // DNS proxy instance
-	dnsFilter  *filtering.DNSFilter  // DNS filter instance
-	dhcpServer dhcpd.ServerInterface // DHCP server instance (optional)
-	queryLog   querylog.QueryLog     // Query log instance
-	stats      stats.Stats
-	access     *accessCtx
+	dnsProxy   *proxy.Proxy         // DNS proxy instance
+	dnsFilter  *filtering.DNSFilter // DNS filter instance
+	dhcpServer dhcpd.Interface      // DHCP server instance (optional)
+	queryLog   querylog.QueryLog    // Query log instance
+	stats      stats.Interface
+	access     *accessManager
 
 	// localDomainSuffix is the suffix used to detect internal hosts.  It
 	// must be a valid domain name plus dots on each side.
 	localDomainSuffix string
 
 	ipset          ipsetCtx
-	subnetDetector *aghnet.SubnetDetector
+	privateNets    netutil.SubnetSet
 	localResolvers *proxy.Proxy
 	sysResolvers   aghnet.SystemResolvers
-	recDetector    *recursionDetector
+
+	// recDetector is a cache for recursive requests.  It is used to detect
+	// and prevent recursive requests only for private upstreams.
+	//
+	// See https://github.com/adguardTeam/adGuardHome/issues/3185#issuecomment-851048135.
+	recDetector *recursionDetector
+
+	// dns64Pref is the NAT64 prefix used for DNS64 response mapping.  The major
+	// part of DNS64 happens inside the [proxy] package, but there still are
+	// some places where response mapping is needed (e.g. DHCP).
+	dns64Pref netip.Prefix
+
+	// anonymizer masks the client's IP addresses if needed.
+	anonymizer *aghnet.IPMut
 
 	tableHostToIP     hostToIPTable
 	tableHostToIPLock sync.Mutex
 
-	tableIPToHost     *netutil.IPMap
+	tableIPToHost     ipToHostTable
 	tableIPToHostLock sync.Mutex
 
-	// clientIDCache is a temporary storage for clientIDs that were
-	// extracted during the BeforeRequestHandler stage.
+	// clientIDCache is a temporary storage for ClientIDs that were extracted
+	// during the BeforeRequestHandler stage.
 	clientIDCache cache.Cache
 
 	// DNS proxy instance for internal usage
@@ -94,6 +111,10 @@ type Server struct {
 	internalProxy *proxy.Proxy
 
 	isRunning bool
+
+	// protectionUpdateInProgress is used to make sure that only one goroutine
+	// updating the protection configuration after a pause is running at a time.
+	protectionUpdateInProgress atomic.Bool
 
 	conf ServerConfig
 	// serverLock protects Server.
@@ -104,27 +125,17 @@ type Server struct {
 // when no suffix is provided.
 //
 // See the documentation for Server.localDomainSuffix.
-const defaultLocalDomainSuffix = ".lan."
+const defaultLocalDomainSuffix = "lan"
 
 // DNSCreateParams are parameters to create a new server.
 type DNSCreateParams struct {
-	DNSFilter      *filtering.DNSFilter
-	Stats          stats.Stats
-	QueryLog       querylog.QueryLog
-	DHCPServer     dhcpd.ServerInterface
-	SubnetDetector *aghnet.SubnetDetector
-	LocalDomain    string
-}
-
-// domainNameToSuffix converts a domain name into a local domain suffix.
-func domainNameToSuffix(tld string) (suffix string) {
-	l := len(tld) + 2
-	b := make([]byte, l)
-	b[0] = '.'
-	copy(b[1:], tld)
-	b[l-1] = '.'
-
-	return string(b)
+	DNSFilter   *filtering.DNSFilter
+	Stats       stats.Interface
+	QueryLog    querylog.QueryLog
+	DHCPServer  dhcpd.Interface
+	PrivateNets netutil.SubnetSet
+	Anonymizer  *aghnet.IPMut
+	LocalDomain string
 }
 
 const (
@@ -147,25 +158,29 @@ func NewServer(p DNSCreateParams) (s *Server, err error) {
 			return nil, fmt.Errorf("local domain: %w", err)
 		}
 
-		localDomainSuffix = domainNameToSuffix(p.LocalDomain)
+		localDomainSuffix = p.LocalDomain
 	}
 
+	if p.Anonymizer == nil {
+		p.Anonymizer = aghnet.NewIPMut(nil)
+	}
 	s = &Server{
 		dnsFilter:         p.DNSFilter,
 		stats:             p.Stats,
 		queryLog:          p.QueryLog,
-		subnetDetector:    p.SubnetDetector,
+		privateNets:       p.PrivateNets,
 		localDomainSuffix: localDomainSuffix,
 		recDetector:       newRecursionDetector(recursionTTL, cachedRecurrentReqNum),
 		clientIDCache: cache.New(cache.Config{
 			EnableLRU: true,
 			MaxCount:  defaultClientIDCacheCount,
 		}),
+		anonymizer: p.Anonymizer,
 	}
 
 	// TODO(e.burkov): Enable the refresher after the actual implementation
 	// passes the public testing.
-	s.sysResolvers, err = aghnet.NewSystemResolvers(0, nil)
+	s.sysResolvers, err = aghnet.NewSystemResolvers(nil)
 	if err != nil {
 		return nil, fmt.Errorf("initializing system resolvers: %w", err)
 	}
@@ -182,18 +197,6 @@ func NewServer(p DNSCreateParams) (s *Server, err error) {
 	}
 
 	return s, nil
-}
-
-// NewCustomServer creates a new instance of *Server with custom internal proxy.
-func NewCustomServer(internalProxy *proxy.Proxy) *Server {
-	s := &Server{
-		recDetector: newRecursionDetector(0, 1),
-	}
-	if internalProxy != nil {
-		s.internalProxy = internalProxy
-	}
-
-	return s
 }
 
 // Close gracefully closes the server.  It is safe for concurrent use.
@@ -255,23 +258,27 @@ func (s *Server) Resolve(host string) ([]net.IPAddr, error) {
 
 // RDNSExchanger is a resolver for clients' addresses.
 type RDNSExchanger interface {
-	// Exchange tries to resolve the ip in a suitable way, e.g. either as
-	// local or as external.
+	// Exchange tries to resolve the ip in a suitable way, i.e. either as local
+	// or as external.
 	Exchange(ip net.IP) (host string, err error)
+
 	// ResolvesPrivatePTR returns true if the RDNSExchanger is able to
 	// resolve PTR requests for locally-served addresses.
 	ResolvesPrivatePTR() (ok bool)
 }
 
 const (
-	// rDNSEmptyAnswerErr is returned by Exchange method when the answer
-	// section of respond is empty.
-	rDNSEmptyAnswerErr errors.Error = "the answer section is empty"
+	// ErrRDNSNoData is returned by [RDNSExchanger.Exchange] when the answer
+	// section of response is either NODATA or has no PTR records.
+	ErrRDNSNoData errors.Error = "no ptr data in response"
 
-	// rDNSNotPTRErr is returned by Exchange method when the response is not
-	// of PTR type.
-	rDNSNotPTRErr errors.Error = "the response is not a ptr"
+	// ErrRDNSFailed is returned by [RDNSExchanger.Exchange] if the received
+	// response is not a NOERROR or NXDOMAIN.
+	ErrRDNSFailed errors.Error = "failed to resolve ptr"
 )
+
+// type check
+var _ RDNSExchanger = (*Server)(nil)
 
 // Exchange implements the RDNSExchanger interface for *Server.
 func (s *Server) Exchange(ip net.IP) (host string, err error) {
@@ -306,31 +313,40 @@ func (s *Server) Exchange(ip net.IP) (host string, err error) {
 		StartTime: time.Now(),
 	}
 
-	resolver := s.internalProxy
-	if s.subnetDetector.IsLocallyServedNetwork(ip) {
+	var resolver *proxy.Proxy
+	if s.privateNets.Contains(ip) {
 		if !s.conf.UsePrivateRDNS {
 			return "", nil
 		}
 
 		resolver = s.localResolvers
 		s.recDetector.add(*req)
+	} else {
+		resolver = s.internalProxy
 	}
 
 	if err = resolver.Resolve(ctx); err != nil {
 		return "", err
 	}
 
+	// Distinguish between NODATA response and a failed request.
 	resp := ctx.Res
-	if len(resp.Answer) == 0 {
-		return "", fmt.Errorf("lookup for %q: %w", arpa, rDNSEmptyAnswerErr)
+	if resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError {
+		return "", fmt.Errorf(
+			"received %s response: %w",
+			dns.RcodeToString[resp.Rcode],
+			ErrRDNSFailed,
+		)
 	}
 
-	ptr, ok := resp.Answer[0].(*dns.PTR)
-	if !ok {
-		return "", fmt.Errorf("type checking: %w", rDNSNotPTRErr)
+	for _, ans := range resp.Answer {
+		ptr, ok := ans.(*dns.PTR)
+		if ok {
+			return strings.TrimSuffix(ptr.Ptr, "."), nil
+		}
 	}
 
-	return strings.TrimSuffix(ptr.Ptr, "."), nil
+	return "", ErrRDNSNoData
 }
 
 // ResolvesPrivatePTR implements the RDNSExchanger interface for *Server.
@@ -435,7 +451,9 @@ func (s *Server) setupResolvers(localAddrs []string) (err error) {
 		&upstream.Options{
 			Bootstrap: bootstraps,
 			Timeout:   defaultLocalTimeout,
-			// TODO(e.burkov): Should we verify server's ceritificates?
+			// TODO(e.burkov): Should we verify server's certificates?
+
+			PreferIPv6: s.conf.BootstrapPreferIPv6,
 		},
 	)
 	if err != nil {
@@ -451,73 +469,121 @@ func (s *Server) setupResolvers(localAddrs []string) (err error) {
 	return nil
 }
 
-// Prepare the object
-func (s *Server) Prepare(config *ServerConfig) error {
-	// Initialize the server configuration
-	// --
-	if config != nil {
-		s.conf = *config
-		if s.conf.BlockingMode == "custom_ip" {
-			if s.conf.BlockingIPv4 == nil || s.conf.BlockingIPv6 == nil {
-				return fmt.Errorf("dns: invalid custom blocking IP address specified")
-			}
-		}
+// Prepare initializes parameters of s using data from conf.  conf must not be
+// nil.
+func (s *Server) Prepare(conf *ServerConfig) (err error) {
+	s.conf = *conf
+
+	err = validateBlockingMode(s.conf.BlockingMode, s.conf.BlockingIPv4, s.conf.BlockingIPv6)
+	if err != nil {
+		return fmt.Errorf("checking blocking mode: %w", err)
 	}
 
-	// Set default values in the case if nothing is configured
-	// --
 	s.initDefaultSettings()
 
-	// Initialize ipset configuration
-	// --
-	err := s.ipset.init(s.conf.IpsetList)
+	err = s.prepareIpsetListSettings()
 	if err != nil {
-		return err
+		// Don't wrap the error, because it's informative enough as is.
+		return fmt.Errorf("preparing ipset settings: %w", err)
 	}
 
-	log.Debug("inited ipset")
-
-	// Prepare DNS servers settings
-	// --
 	err = s.prepareUpstreamSettings()
 	if err != nil {
-		return err
+		return fmt.Errorf("preparing upstream settings: %w", err)
 	}
 
-	// Create DNS proxy configuration
-	// --
 	var proxyConfig proxy.Config
 	proxyConfig, err = s.createProxyConfig()
 	if err != nil {
-		return err
+		return fmt.Errorf("preparing proxy: %w", err)
 	}
 
-	// Prepare a DNS proxy instance that we use for internal DNS queries
-	// --
-	s.prepareIntlProxy()
+	s.setupDNS64()
 
-	s.access, err = newAccessCtx(s.conf.AllowedClients, s.conf.DisallowedClients, s.conf.BlockedHosts)
+	err = s.prepareInternalProxy()
 	if err != nil {
-		return err
+		return fmt.Errorf("preparing internal proxy: %w", err)
 	}
 
-	// Register web handlers if necessary
-	// --
-	if !webRegistered && s.conf.HTTPRegister != nil {
-		webRegistered = true
-		s.registerHandlers()
+	s.access, err = newAccessCtx(
+		s.conf.AllowedClients,
+		s.conf.DisallowedClients,
+		s.conf.BlockedHosts,
+	)
+	if err != nil {
+		return fmt.Errorf("preparing access: %w", err)
 	}
 
-	// Create the main DNS proxy instance
-	// --
-	s.dnsProxy = &proxy.Proxy{Config: proxyConfig}
+	s.registerHandlers()
 
+	// TODO(e.burkov):  Remove once the local resolvers logic moved to dnsproxy.
 	err = s.setupResolvers(s.conf.LocalPTRResolvers)
 	if err != nil {
 		return fmt.Errorf("setting up resolvers: %w", err)
 	}
 
+	if s.conf.UsePrivateRDNS {
+		proxyConfig.PrivateRDNSUpstreamConfig = s.localResolvers.UpstreamConfig
+	}
+
+	s.dnsProxy = &proxy.Proxy{Config: proxyConfig}
+
 	s.recDetector.clear()
+
+	return nil
+}
+
+// validateBlockingMode returns an error if the blocking mode data aren't valid.
+func validateBlockingMode(mode BlockingMode, blockingIPv4, blockingIPv6 net.IP) (err error) {
+	switch mode {
+	case
+		BlockingModeDefault,
+		BlockingModeNXDOMAIN,
+		BlockingModeREFUSED,
+		BlockingModeNullIP:
+		return nil
+	case BlockingModeCustomIP:
+		if blockingIPv4 == nil {
+			return fmt.Errorf("blocking_ipv4 must be set when blocking_mode is custom_ip")
+		} else if blockingIPv6 == nil {
+			return fmt.Errorf("blocking_ipv6 must be set when blocking_mode is custom_ip")
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("bad blocking mode %q", mode)
+	}
+}
+
+// prepareInternalProxy initializes the DNS proxy that is used for internal DNS
+// queries, such as public clients PTR resolving and updater hostname resolving.
+func (s *Server) prepareInternalProxy() (err error) {
+	srvConf := s.conf
+	conf := &proxy.Config{
+		CacheEnabled:   true,
+		CacheSizeBytes: 4096,
+		UpstreamConfig: srvConf.UpstreamConfig,
+		MaxGoroutines:  int(s.conf.MaxGoroutines),
+	}
+
+	setProxyUpstreamMode(
+		conf,
+		srvConf.AllServers,
+		srvConf.FastestAddr,
+		srvConf.FastestTimeout.Duration,
+	)
+
+	// TODO(a.garipov): Make a proper constructor for proxy.Proxy.
+	p := &proxy.Proxy{
+		Config: *conf,
+	}
+
+	err = p.Init()
+	if err != nil {
+		return err
+	}
+
+	s.internalProxy = p
 
 	return nil
 }
@@ -530,16 +596,35 @@ func (s *Server) Stop() error {
 	return s.stopLocked()
 }
 
-// stopLocked stops the DNS server without locking. For internal use only.
-func (s *Server) stopLocked() error {
+// stopLocked stops the DNS server without locking.  For internal use only.
+func (s *Server) stopLocked() (err error) {
+	// TODO(e.burkov, a.garipov):  Return critical errors, not just log them.
+	// This will require filtering all the non-critical errors in
+	// [upstream.Upstream] implementations.
+
 	if s.dnsProxy != nil {
-		err := s.dnsProxy.Stop()
+		err = s.dnsProxy.Stop()
 		if err != nil {
-			return fmt.Errorf("could not stop the DNS server properly: %w", err)
+			log.Error("dnsforward: closing primary resolvers: %s", err)
+		}
+	}
+
+	if upsConf := s.internalProxy.UpstreamConfig; upsConf != nil {
+		err = upsConf.Close()
+		if err != nil {
+			log.Error("dnsforward: closing internal resolvers: %s", err)
+		}
+	}
+
+	if upsConf := s.localResolvers.UpstreamConfig; upsConf != nil {
+		err = upsConf.Close()
+		if err != nil {
+			log.Error("dnsforward: closing local resolvers: %s", err)
 		}
 	}
 
 	s.isRunning = false
+
 	return nil
 }
 
@@ -551,7 +636,7 @@ func (s *Server) IsRunning() bool {
 	return s.isRunning
 }
 
-// srvClosedErr is returned when the method can't complete without unacessible
+// srvClosedErr is returned when the method can't complete without inaccessible
 // data from the closing server.
 const srvClosedErr errors.Error = "server is closed"
 
@@ -567,7 +652,7 @@ func (s *Server) proxy() (p *proxy.Proxy) {
 }
 
 // Reconfigure applies the new configuration to the DNS server.
-func (s *Server) Reconfigure(config *ServerConfig) error {
+func (s *Server) Reconfigure(conf *ServerConfig) error {
 	s.serverLock.Lock()
 	defer s.serverLock.Unlock()
 
@@ -581,7 +666,12 @@ func (s *Server) Reconfigure(config *ServerConfig) error {
 	// We wait for some time and hope that this fd will be closed.
 	time.Sleep(100 * time.Millisecond)
 
-	err = s.Prepare(config)
+	// TODO(a.garipov): This whole piece of API is weird and needs to be remade.
+	if conf == nil {
+		conf = &s.conf
+	}
+
+	err = s.Prepare(conf)
 	if err != nil {
 		return fmt.Errorf("could not reconfigure the server: %w", err)
 	}
@@ -603,31 +693,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // IsBlockedClient returns true if the client is blocked by the current access
 // settings.
-func (s *Server) IsBlockedClient(ip net.IP, clientID string) (blocked bool, rule string) {
+func (s *Server) IsBlockedClient(ip netip.Addr, clientID string) (blocked bool, rule string) {
 	s.serverLock.RLock()
 	defer s.serverLock.RUnlock()
 
+	blockedByIP := false
+	if ip != (netip.Addr{}) {
+		blockedByIP, rule = s.access.isBlockedIP(ip)
+	}
+
 	allowlistMode := s.access.allowlistMode()
-	blockedByIP, rule := s.access.isBlockedIP(ip)
 	blockedByClientID := s.access.isBlockedClientID(clientID)
 
-	// Allow if at least one of the checks allows in allowlist mode, but
-	// block if at least one of the checks blocks in blocklist mode.
+	// Allow if at least one of the checks allows in allowlist mode, but block
+	// if at least one of the checks blocks in blocklist mode.
 	if allowlistMode && blockedByIP && blockedByClientID {
-		log.Debug("client %s (id %q) is not in access allowlist", ip, clientID)
+		log.Debug("client %v (id %q) is not in access allowlist", ip, clientID)
 
 		// Return now without substituting the empty rule for the
 		// clientID because the rule can't be empty here.
 		return true, rule
 	} else if !allowlistMode && (blockedByIP || blockedByClientID) {
-		log.Debug("client %s (id %q) is in access blocklist", ip, clientID)
+		log.Debug("client %v (id %q) is in access blocklist", ip, clientID)
 
 		blocked = true
 	}
 
-	if rule == "" {
-		rule = clientID
-	}
-
-	return blocked, rule
+	return blocked, aghalg.Coalesce(rule, clientID)
 }

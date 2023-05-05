@@ -8,11 +8,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
+	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/httphdr"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/timeutil"
@@ -31,7 +35,8 @@ const sessionTokenSize = 16
 
 type session struct {
 	userName string
-	expire   uint32 // expiration time (in seconds)
+	// expire is the expiration time, in seconds.
+	expire uint32
 }
 
 func (s *session) serialize() []byte {
@@ -63,29 +68,29 @@ func (s *session) deserialize(data []byte) bool {
 
 // Auth - global object
 type Auth struct {
-	db         *bbolt.DB
-	blocker    *authRateLimiter
-	sessions   map[string]*session
-	users      []User
-	lock       sync.Mutex
-	sessionTTL uint32
+	db          *bbolt.DB
+	raleLimiter *authRateLimiter
+	sessions    map[string]*session
+	users       []webUser
+	lock        sync.Mutex
+	sessionTTL  uint32
 }
 
-// User object
-type User struct {
+// webUser represents a user of the Web UI.
+type webUser struct {
 	Name         string `yaml:"name"`
-	PasswordHash string `yaml:"password"` // bcrypt hash
+	PasswordHash string `yaml:"password"`
 }
 
 // InitAuth - create a global object
-func InitAuth(dbFilename string, users []User, sessionTTL uint32, blocker *authRateLimiter) *Auth {
+func InitAuth(dbFilename string, users []webUser, sessionTTL uint32, rateLimiter *authRateLimiter) *Auth {
 	log.Info("Initializing auth module: %s", dbFilename)
 
 	a := &Auth{
-		sessionTTL: sessionTTL,
-		blocker:    blocker,
-		sessions:   make(map[string]*session),
-		users:      users,
+		sessionTTL:  sessionTTL,
+		raleLimiter: rateLimiter,
+		sessions:    make(map[string]*session),
+		users:       users,
 	}
 	var err error
 	a.db, err = bbolt.Open(dbFilename, 0o644, nil)
@@ -325,35 +330,25 @@ func newSessionToken() (data []byte, err error) {
 	return randData, nil
 }
 
-// cookieTimeFormat is the format to be used in (time.Time).Format for cookie's
-// expiry field.
-const cookieTimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
-
-// cookieExpiryFormat returns the formatted exp to be used in cookie string.
-// It's quite simple for now, but probably will be expanded in the future.
-func cookieExpiryFormat(exp time.Time) (formatted string) {
-	return exp.Format(cookieTimeFormat)
-}
-
-func (a *Auth) httpCookie(req loginJSON, addr string) (cookie string, err error) {
-	blocker := a.blocker
-	u := a.UserFind(req.Name, req.Password)
-	if len(u.Name) == 0 {
-		if blocker != nil {
-			blocker.inc(addr)
+// newCookie creates a new authentication cookie.
+func (a *Auth) newCookie(req loginJSON, addr string) (c *http.Cookie, err error) {
+	rateLimiter := a.raleLimiter
+	u, ok := a.findUser(req.Name, req.Password)
+	if !ok {
+		if rateLimiter != nil {
+			rateLimiter.inc(addr)
 		}
 
-		return "", err
+		return nil, errors.Error("invalid username or password")
 	}
 
-	if blocker != nil {
-		blocker.remove(addr)
+	if rateLimiter != nil {
+		rateLimiter.remove(addr)
 	}
 
-	var sess []byte
-	sess, err = newSessionToken()
+	sess, err := newSessionToken()
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("generating token: %w", err)
 	}
 
 	now := time.Now().UTC()
@@ -363,11 +358,15 @@ func (a *Auth) httpCookie(req loginJSON, addr string) (cookie string, err error)
 		expire:   uint32(now.Unix()) + a.sessionTTL,
 	})
 
-	return fmt.Sprintf(
-		"%s=%s; Path=/; HttpOnly; Expires=%s",
-		sessionCookieName, hex.EncodeToString(sess),
-		cookieExpiryFormat(now.Add(cookieTTL)),
-	), nil
+	return &http.Cookie{
+		Name:    sessionCookieName,
+		Value:   hex.EncodeToString(sess),
+		Path:    "/",
+		Expires: now.Add(cookieTTL),
+
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}, nil
 }
 
 // realIP extracts the real IP address of the client from an HTTP request using
@@ -381,9 +380,9 @@ func (a *Auth) httpCookie(req loginJSON, addr string) (cookie string, err error)
 // TODO(a.garipov): Support header Forwarded from RFC 7329.
 func realIP(r *http.Request) (ip net.IP, err error) {
 	proxyHeaders := []string{
-		"CF-Connecting-IP",
-		"True-Client-IP",
-		"X-Real-IP",
+		httphdr.CFConnectingIP,
+		httphdr.TrueClientIP,
+		httphdr.XRealIP,
 	}
 
 	for _, h := range proxyHeaders {
@@ -396,15 +395,15 @@ func realIP(r *http.Request) (ip net.IP, err error) {
 
 	// If none of the above yielded any results, get the leftmost IP address
 	// from the X-Forwarded-For header.
-	s := r.Header.Get("X-Forwarded-For")
+	s := r.Header.Get(httphdr.XForwardedFor)
 	ipStrs := strings.SplitN(s, ", ", 2)
 	ip = net.ParseIP(ipStrs[0])
 	if ip != nil {
 		return ip, nil
 	}
 
-	// When everything else fails, just return the remote address as
-	// understood by the stdlib.
+	// When everything else fails, just return the remote address as understood
+	// by the stdlib.
 	ipStr, err := netutil.SplitHost(r.RemoteAddr)
 	if err != nil {
 		return nil, fmt.Errorf("getting ip from client addr: %w", err)
@@ -413,33 +412,58 @@ func realIP(r *http.Request) (ip net.IP, err error) {
 	return net.ParseIP(ipStr), nil
 }
 
+// writeErrorWithIP is like [aghhttp.Error], but includes the remote IP address
+// when it writes to the log.
+func writeErrorWithIP(
+	r *http.Request,
+	w http.ResponseWriter,
+	code int,
+	remoteIP string,
+	format string,
+	args ...any,
+) {
+	text := fmt.Sprintf(format, args...)
+	log.Error("%s %s %s: from ip %s: %s", r.Method, r.Host, r.URL, remoteIP, text)
+	http.Error(w, text, code)
+}
+
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	req := loginJSON{}
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "json decode: %s", err)
+		aghhttp.Error(r, w, http.StatusBadRequest, "json decode: %s", err)
 
 		return
 	}
 
-	var remoteAddr string
-	// The realIP couldn't be used here due to security issues.
+	var remoteIP string
+	// realIP cannot be used here without taking TrustedProxies into account due
+	// to security issues.
 	//
 	// See https://github.com/AdguardTeam/AdGuardHome/issues/2799.
 	//
 	// TODO(e.burkov): Use realIP when the issue will be fixed.
-	if remoteAddr, err = netutil.SplitHost(r.RemoteAddr); err != nil {
-		httpError(w, http.StatusBadRequest, "auth: getting remote address: %s", err)
+	if remoteIP, err = netutil.SplitHost(r.RemoteAddr); err != nil {
+		writeErrorWithIP(
+			r,
+			w,
+			http.StatusBadRequest,
+			r.RemoteAddr,
+			"auth: getting remote address: %s",
+			err,
+		)
 
 		return
 	}
 
-	if blocker := Context.auth.blocker; blocker != nil {
-		if left := blocker.check(remoteAddr); left > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(int(left.Seconds())))
-			httpError(
+	if rateLimiter := Context.auth.raleLimiter; rateLimiter != nil {
+		if left := rateLimiter.check(remoteIP); left > 0 {
+			w.Header().Set(httphdr.RetryAfter, strconv.Itoa(int(left.Seconds())))
+			writeErrorWithIP(
+				r,
 				w,
 				http.StatusTooManyRequests,
+				remoteIP,
 				"auth: blocked for %s",
 				left,
 			)
@@ -448,53 +472,57 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var cookie string
-	cookie, err = Context.auth.httpCookie(req, remoteAddr)
+	cookie, err := Context.auth.newCookie(req, remoteIP)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "crypto rand reader: %s", err)
+		writeErrorWithIP(r, w, http.StatusForbidden, remoteIP, "%s", err)
 
 		return
 	}
 
-	if len(cookie) == 0 {
-		var ip net.IP
-		ip, err = realIP(r)
-		if err != nil {
-			log.Info("auth: getting real ip from request: %s", err)
-		} else if ip == nil {
-			// Technically shouldn't happen.
-			log.Info("auth: failed to login user %q from unknown ip", req.Name)
-		} else {
-			log.Info("auth: failed to login user %q from ip %q", req.Name, ip)
-		}
-		time.Sleep(1 * time.Second)
-
-		http.Error(w, "invalid username or password", http.StatusBadRequest)
-
-		return
+	// Use realIP here, since this IP address is only used for logging.
+	ip, err := realIP(r)
+	if err != nil {
+		log.Error("auth: getting real ip from request with remote ip %s: %s", remoteIP, err)
 	}
 
-	w.Header().Set("Set-Cookie", cookie)
+	log.Info("auth: user %q successfully logged in from ip %v", req.Name, ip)
 
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
+	http.SetCookie(w, cookie)
 
-	returnOK(w)
+	h := w.Header()
+	h.Set(httphdr.CacheControl, "no-store, no-cache, must-revalidate, proxy-revalidate")
+	h.Set(httphdr.Pragma, "no-cache")
+	h.Set(httphdr.Expires, "0")
+
+	aghhttp.OK(w)
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
-	cookie := r.Header.Get("Cookie")
-	sess := parseCookie(cookie)
+	respHdr := w.Header()
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		// The only error that is returned from r.Cookie is [http.ErrNoCookie].
+		// The user is already logged out.
+		respHdr.Set(httphdr.Location, "/login.html")
+		w.WriteHeader(http.StatusFound)
 
-	Context.auth.RemoveSession(sess)
+		return
+	}
 
-	w.Header().Set("Location", "/login.html")
+	Context.auth.RemoveSession(c.Value)
 
-	s := fmt.Sprintf("%s=; Path=/; HttpOnly; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
-		sessionCookieName)
-	w.Header().Set("Set-Cookie", s)
+	c = &http.Cookie{
+		Name:    sessionCookieName,
+		Value:   "",
+		Path:    "/",
+		Expires: time.Unix(0, 0),
 
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}
+
+	respHdr.Set(httphdr.Location, "/login.html")
+	respHdr.Set(httphdr.SetCookie, c.String())
 	w.WriteHeader(http.StatusFound)
 }
 
@@ -504,99 +532,104 @@ func RegisterAuthHandlers() {
 	httpRegister(http.MethodGet, "/control/logout", handleLogout)
 }
 
-func parseCookie(cookie string) string {
-	pairs := strings.Split(cookie, ";")
-	for _, pair := range pairs {
-		pair = strings.TrimSpace(pair)
-		kv := strings.SplitN(pair, "=", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		if kv[0] == sessionCookieName {
-			return kv[1]
-		}
-	}
-	return ""
-}
-
 // optionalAuthThird return true if user should authenticate first.
-func optionalAuthThird(w http.ResponseWriter, r *http.Request) (authFirst bool) {
-	authFirst = false
+func optionalAuthThird(w http.ResponseWriter, r *http.Request) (mustAuth bool) {
+	if glProcessCookie(r) {
+		log.Debug("auth: authentication is handled by GL-Inet submodule")
+
+		return false
+	}
 
 	// redirect to login page if not authenticated
-	ok := false
+	isAuthenticated := false
 	cookie, err := r.Cookie(sessionCookieName)
-
-	if glProcessCookie(r) {
-		log.Debug("auth: authentification was handled by GL-Inet submodule")
-		ok = true
-	} else if err == nil {
-		r := Context.auth.checkSession(cookie.Value)
-		if r == checkSessionOK {
-			ok = true
-		} else if r < 0 {
-			log.Debug("auth: invalid cookie value: %s", cookie)
-		}
-	} else {
-		// there's no Cookie, check Basic authentication
-		user, pass, ok2 := r.BasicAuth()
-		if ok2 {
-			u := Context.auth.UserFind(user, pass)
-			if len(u.Name) != 0 {
-				ok = true
-			} else {
+	if err != nil {
+		// The only error that is returned from r.Cookie is [http.ErrNoCookie].
+		// Check Basic authentication.
+		user, pass, hasBasic := r.BasicAuth()
+		if hasBasic {
+			_, isAuthenticated = Context.auth.findUser(user, pass)
+			if !isAuthenticated {
 				log.Info("auth: invalid Basic Authorization value")
 			}
 		}
-	}
-	if !ok {
-		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
-			if glProcessRedirect(w, r) {
-				log.Debug("auth: redirected to login page by GL-Inet submodule")
-			} else {
-				w.Header().Set("Location", "/login.html")
-				w.WriteHeader(http.StatusFound)
-			}
-		} else {
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte("Forbidden"))
+	} else {
+		res := Context.auth.checkSession(cookie.Value)
+		isAuthenticated = res == checkSessionOK
+		if !isAuthenticated {
+			log.Debug("auth: invalid cookie value: %s", cookie)
 		}
-		authFirst = true
 	}
 
-	return authFirst
+	if isAuthenticated {
+		return false
+	}
+
+	if p := r.URL.Path; p == "/" || p == "/index.html" {
+		if glProcessRedirect(w, r) {
+			log.Debug("auth: redirected to login page by GL-Inet submodule")
+		} else {
+			log.Debug("auth: redirected to login page")
+			http.Redirect(w, r, "login.html", http.StatusFound)
+		}
+	} else {
+		log.Debug("auth: responded with forbidden to %s %s", r.Method, p)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("Forbidden"))
+	}
+
+	return true
 }
 
-func optionalAuth(handler func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+// TODO(a.garipov): Use [http.Handler] consistently everywhere throughout the
+// project.
+func optionalAuth(
+	h func(http.ResponseWriter, *http.Request),
+) (wrapped func(http.ResponseWriter, *http.Request)) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/login.html" {
-			// redirect to dashboard if already authenticated
-			authRequired := Context.auth != nil && Context.auth.AuthRequired()
+		p := r.URL.Path
+		authRequired := Context.auth != nil && Context.auth.AuthRequired()
+		if p == "/login.html" {
 			cookie, err := r.Cookie(sessionCookieName)
 			if authRequired && err == nil {
-				r := Context.auth.checkSession(cookie.Value)
-				if r == checkSessionOK {
-					w.Header().Set("Location", "/")
-					w.WriteHeader(http.StatusFound)
+				// Redirect to the dashboard if already authenticated.
+				res := Context.auth.checkSession(cookie.Value)
+				if res == checkSessionOK {
+					http.Redirect(w, r, "", http.StatusFound)
 
 					return
-				} else if r == checkSessionNotFound {
-					log.Debug("auth: invalid cookie value: %s", cookie)
 				}
-			}
 
-		} else if strings.HasPrefix(r.URL.Path, "/assets/") ||
-			strings.HasPrefix(r.URL.Path, "/login.") {
-			// process as usual
-			// no additional auth requirements
-		} else if Context.auth != nil && Context.auth.AuthRequired() {
+				log.Debug("auth: invalid cookie value: %s", cookie)
+			}
+		} else if isPublicResource(p) {
+			// Process as usual, no additional auth requirements.
+		} else if authRequired {
 			if optionalAuthThird(w, r) {
 				return
 			}
 		}
 
-		handler(w, r)
+		h(w, r)
 	}
+}
+
+// isPublicResource returns true if p is a path to a public resource.
+func isPublicResource(p string) (ok bool) {
+	isAsset, err := path.Match("/assets/*", p)
+	if err != nil {
+		// The only error that is returned from path.Match is
+		// [path.ErrBadPattern].  This is a programmer error.
+		panic(fmt.Errorf("bad asset pattern: %w", err))
+	}
+
+	isLogin, err := path.Match("/login.*", p)
+	if err != nil {
+		// Same as above.
+		panic(fmt.Errorf("bad login pattern: %w", err))
+	}
+
+	return isAsset || isLogin
 }
 
 type authHandler struct {
@@ -612,7 +645,7 @@ func optionalAuthHandler(handler http.Handler) http.Handler {
 }
 
 // UserAdd - add new user
-func (a *Auth) UserAdd(u *User, password string) {
+func (a *Auth) UserAdd(u *webUser, password string) {
 	if len(password) == 0 {
 		return
 	}
@@ -631,31 +664,35 @@ func (a *Auth) UserAdd(u *User, password string) {
 	log.Debug("auth: added user: %s", u.Name)
 }
 
-// UserFind - find a user
-func (a *Auth) UserFind(login, password string) User {
+// findUser returns a user if there is one.
+func (a *Auth) findUser(login, password string) (u webUser, ok bool) {
 	a.lock.Lock()
 	defer a.lock.Unlock()
-	for _, u := range a.users {
+
+	for _, u = range a.users {
 		if u.Name == login &&
 			bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) == nil {
-			return u
+			return u, true
 		}
 	}
-	return User{}
+
+	return webUser{}, false
 }
 
 // getCurrentUser returns the current user.  It returns an empty User if the
 // user is not found.
-func (a *Auth) getCurrentUser(r *http.Request) User {
+func (a *Auth) getCurrentUser(r *http.Request) (u webUser) {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil {
 		// There's no Cookie, check Basic authentication.
 		user, pass, ok := r.BasicAuth()
 		if ok {
-			return Context.auth.UserFind(user, pass)
+			u, _ = Context.auth.findUser(user, pass)
+
+			return u
 		}
 
-		return User{}
+		return webUser{}
 	}
 
 	a.lock.Lock()
@@ -663,20 +700,20 @@ func (a *Auth) getCurrentUser(r *http.Request) User {
 
 	s, ok := a.sessions[cookie.Value]
 	if !ok {
-		return User{}
+		return webUser{}
 	}
 
-	for _, u := range a.users {
+	for _, u = range a.users {
 		if u.Name == s.userName {
 			return u
 		}
 	}
 
-	return User{}
+	return webUser{}
 }
 
 // GetUsers - get users
-func (a *Auth) GetUsers() []User {
+func (a *Auth) GetUsers() []webUser {
 	a.lock.Lock()
 	users := a.users
 	a.lock.Unlock()

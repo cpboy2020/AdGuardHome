@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/AdGuardHome/internal/querylog"
 	"github.com/AdguardTeam/AdGuardHome/internal/stats"
@@ -15,32 +16,42 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testQueryLog is a simple querylog.QueryLog implementation for tests.
+// testQueryLog is a simple [querylog.QueryLog] implementation for tests.
 type testQueryLog struct {
 	// QueryLog is embedded here simply to make testQueryLog
-	// a querylog.QueryLog without actually implementing all methods.
+	// a [querylog.QueryLog] without actually implementing all methods.
 	querylog.QueryLog
 
-	lastParams querylog.AddParams
+	lastParams *querylog.AddParams
 }
 
-// Add implements the querylog.QueryLog interface for *testQueryLog.
-func (l *testQueryLog) Add(p querylog.AddParams) {
+// Add implements the [querylog.QueryLog] interface for *testQueryLog.
+func (l *testQueryLog) Add(p *querylog.AddParams) {
 	l.lastParams = p
 }
 
-// testStats is a simple stats.Stats implementation for tests.
+// ShouldLog implements the [querylog.QueryLog] interface for *testQueryLog.
+func (l *testQueryLog) ShouldLog(string, uint16, uint16, []string) bool {
+	return true
+}
+
+// testStats is a simple [stats.Interface] implementation for tests.
 type testStats struct {
-	// Stats is embedded here simply to make testStats a stats.Stats without
-	// actually implementing all methods.
-	stats.Stats
+	// Stats is embedded here simply to make testStats a [stats.Interface]
+	// without actually implementing all methods.
+	stats.Interface
 
 	lastEntry stats.Entry
 }
 
-// Update implements the stats.Stats interface for *testStats.
+// Update implements the [stats.Interface] interface for *testStats.
 func (l *testStats) Update(e stats.Entry) {
 	l.lastEntry = e
+}
+
+// ShouldCount implements the [stats.Interface] interface for *testStats.
+func (l *testStats) ShouldCount(string, uint16, uint16, []string) bool {
+	return true
 }
 
 func TestProcessQueryLogsAndStats(t *testing.T) {
@@ -65,7 +76,7 @@ func TestProcessQueryLogsAndStats(t *testing.T) {
 		reason:         filtering.NotFilteredNotFound,
 		wantStatResult: stats.RNotFiltered,
 	}, {
-		name:           "success_tls_client_id",
+		name:           "success_tls_clientid",
 		proto:          proxy.ProtoTLS,
 		addr:           &net.TCPAddr{IP: net.IP{1, 2, 3, 4}, Port: 1234},
 		clientID:       "cli42",
@@ -160,6 +171,13 @@ func TestProcessQueryLogsAndStats(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, tc := range testCases {
+		ql := &testQueryLog{}
+		st := &testStats{}
+		srv := &Server{
+			queryLog:   ql,
+			stats:      st,
+			anonymizer: aghnet.NewIPMut(nil),
+		}
 		t.Run(tc.name, func(t *testing.T) {
 			req := &dns.Msg{
 				Question: []dns.Question{{
@@ -173,14 +191,7 @@ func TestProcessQueryLogsAndStats(t *testing.T) {
 				Addr:     tc.addr,
 				Upstream: ups,
 			}
-
-			ql := &testQueryLog{}
-			st := &testStats{}
 			dctx := &dnsContext{
-				srv: &Server{
-					queryLog: ql,
-					stats:    st,
-				},
 				proxyCtx:  pctx,
 				startTime: time.Now(),
 				result: &filtering.Result{
@@ -189,7 +200,7 @@ func TestProcessQueryLogsAndStats(t *testing.T) {
 				clientID: tc.clientID,
 			}
 
-			code := processQueryLogsAndStats(dctx)
+			code := srv.processQueryLogsAndStats(dctx)
 			assert.Equal(t, tc.wantCode, code)
 			assert.Equal(t, tc.wantLogProto, ql.lastParams.ClientProto)
 			assert.Equal(t, tc.wantStatClient, st.lastEntry.Client)

@@ -24,6 +24,7 @@ const StaticLeases = ({
     cidr,
     rangeStart,
     rangeEnd,
+    gatewayIp,
 }) => {
     const [t] = useTranslation();
     const dispatch = useDispatch();
@@ -53,23 +54,28 @@ const StaticLeases = ({
                     {
                         Header: 'MAC',
                         accessor: 'mac',
+                        minWidth: 180,
                         Cell: cellWrap,
                     },
                     {
                         Header: 'IP',
                         accessor: 'ip',
+                        minWidth: 230,
                         sortMethod: sortIp,
                         Cell: cellWrap,
                     },
                     {
                         Header: <Trans>dhcp_table_hostname</Trans>,
                         accessor: 'hostname',
+                        minWidth: 230,
                         Cell: cellWrap,
                     },
                     {
                         Header: <Trans>actions_table_header</Trans>,
                         accessor: 'actions',
                         maxWidth: 150,
+                        sortable: false,
+                        resizable: false,
                         // eslint-disable-next-line react/display-name
                         Cell: (row) => {
                             const { ip, mac, hostname } = row.original;
@@ -104,6 +110,7 @@ const StaticLeases = ({
                 cidr={cidr}
                 rangeStart={rangeStart}
                 rangeEnd={rangeEnd}
+                gatewayIp={gatewayIp}
             />
         </>
     );
@@ -117,6 +124,7 @@ StaticLeases.propTypes = {
     cidr: PropTypes.string.isRequired,
     rangeStart: PropTypes.string,
     rangeEnd: PropTypes.string,
+    gatewayIp: PropTypes.string,
 };
 
 cellWrap.propTypes = {

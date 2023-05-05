@@ -399,6 +399,7 @@ Response:
 	"protection_enabled":true,
 	"running":true,
 	"dhcp_available":true,
+    "protection_disabled_duration":0
 	"version":"undefined"
 	}
 
@@ -1353,6 +1354,19 @@ How it works:
 Internally, all supported services are stored as a map:
 
 	service name -> list of rules
+
+
+### API: Get blocked services list of available services
+
+Request:
+
+	GET /control/blocked_services/services
+
+Response:
+
+	200 OK
+
+	[ "name1", ... ]
 
 
 ### API: Get blocked services list

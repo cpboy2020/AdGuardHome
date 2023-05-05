@@ -175,7 +175,7 @@ func TestQLogFile_SeekTS_good(t *testing.T) {
 				assert.NotEqualValues(t, 0, ts)
 
 				// Try seeking to that line now.
-				pos, _, err := q.SeekTS(ts)
+				pos, _, err := q.seekTS(ts)
 				require.NoError(t, err)
 				assert.NotEqualValues(t, 0, pos)
 
@@ -228,7 +228,7 @@ func TestQLogFile_SeekTS_bad(t *testing.T) {
 				assert.NotEqualValues(t, 0, tc.ts)
 
 				var depth int
-				_, depth, err = q.SeekTS(tc.ts)
+				_, depth, err = q.seekTS(tc.ts)
 				assert.NotEmpty(t, l.num)
 				require.Error(t, err)
 
@@ -303,7 +303,7 @@ func NewTestQLogFileData(t *testing.T, data string) (file *QLogFile) {
 func TestQLog_Seek(t *testing.T) {
 	const nl = "\n"
 	const strV = "%s"
-	const recs = `{"T":"` + strV + `","QH":"wfqvjymurpwegyv","QT":"A","QC":"IN","CP":"","Answer":"","Result":{},"Elapsed":66286385,"Upstream":"tls://dns-unfiltered.adguard.com:853"}` + nl +
+	const recs = `{"T":"` + strV + `","QH":"wfqvjymurpwegyv","QT":"A","QC":"IN","CP":"","Answer":"","Result":{},"Elapsed":66286385,"Upstream":"tls://unfiltered.adguard-dns.com:853"}` + nl +
 		`{"T":"` + strV + `"}` + nl +
 		`{"T":"` + strV + `"}` + nl
 	timestamp, _ := time.Parse(time.RFC3339Nano, "2020-08-31T18:44:25.376690873+03:00")
@@ -340,7 +340,7 @@ func TestQLog_Seek(t *testing.T) {
 
 			q := NewTestQLogFileData(t, data)
 
-			_, depth, err := q.SeekTS(timestamp.Add(time.Second * time.Duration(tc.delta)).UnixNano())
+			_, depth, err := q.seekTS(timestamp.Add(time.Second * time.Duration(tc.delta)).UnixNano())
 			require.Truef(t, errors.Is(err, tc.wantErr), "%v", err)
 			assert.Equal(t, tc.wantDepth, depth)
 		})

@@ -3,10 +3,12 @@ package home
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
+	"net/netip"
 
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 )
 
 // clientJSON is a common structure used by several handlers to deal with
@@ -26,7 +28,8 @@ type clientJSON struct {
 	// the allowlist.
 	DisallowedRule *string `json:"disallowed_rule,omitempty"`
 
-	WHOISInfo *RuntimeClientWHOISInfo `json:"whois_info,omitempty"`
+	WHOISInfo      *RuntimeClientWHOISInfo     `json:"whois_info,omitempty"`
+	SafeSearchConf *filtering.SafeSearchConfig `json:"safe_search"`
 
 	Name string `json:"name"`
 
@@ -35,20 +38,24 @@ type clientJSON struct {
 	Tags            []string `json:"tags"`
 	Upstreams       []string `json:"upstreams"`
 
-	FilteringEnabled         bool `json:"filtering_enabled"`
-	ParentalEnabled          bool `json:"parental_enabled"`
-	SafeBrowsingEnabled      bool `json:"safebrowsing_enabled"`
+	FilteringEnabled    bool `json:"filtering_enabled"`
+	ParentalEnabled     bool `json:"parental_enabled"`
+	SafeBrowsingEnabled bool `json:"safebrowsing_enabled"`
+	// Deprecated: use safeSearchConf.
 	SafeSearchEnabled        bool `json:"safesearch_enabled"`
 	UseGlobalBlockedServices bool `json:"use_global_blocked_services"`
 	UseGlobalSettings        bool `json:"use_global_settings"`
+
+	IgnoreQueryLog   aghalg.NullBool `json:"ignore_querylog"`
+	IgnoreStatistics aghalg.NullBool `json:"ignore_statistics"`
 }
 
 type runtimeClientJSON struct {
 	WHOISInfo *RuntimeClientWHOISInfo `json:"whois_info"`
 
-	Name   string `json:"name"`
-	Source string `json:"source"`
-	IP     net.IP `json:"ip"`
+	IP     netip.Addr   `json:"ip"`
+	Name   string       `json:"name"`
+	Source clientSource `json:"source"`
 }
 
 type clientListJSON struct {
@@ -57,8 +64,8 @@ type clientListJSON struct {
 	Tags           []string            `json:"supported_tags"`
 }
 
-// respond with information about configured clients
-func (clients *clientsContainer) handleGetClients(w http.ResponseWriter, _ *http.Request) {
+// handleGetClients is the handler for GET /control/clients HTTP API.
+func (clients *clientsContainer) handleGetClients(w http.ResponseWriter, r *http.Request) {
 	data := clientListJSON{}
 
 	clients.lock.Lock()
@@ -69,69 +76,96 @@ func (clients *clientsContainer) handleGetClients(w http.ResponseWriter, _ *http
 		data.Clients = append(data.Clients, cj)
 	}
 
-	clients.ipToRC.Range(func(ip net.IP, v interface{}) (cont bool) {
-		rc, ok := v.(*RuntimeClient)
-		if !ok {
-			log.Error("dns: bad type %T in ipToRC for %s", v, ip)
-
-			return true
-		}
-
+	for ip, rc := range clients.ipToRC {
 		cj := runtimeClientJSON{
 			WHOISInfo: rc.WHOISInfo,
 
-			Name: rc.Host,
-			IP:   ip,
-		}
-
-		cj.Source = "etc/hosts"
-		switch rc.Source {
-		case ClientSourceDHCP:
-			cj.Source = "DHCP"
-		case ClientSourceRDNS:
-			cj.Source = "rDNS"
-		case ClientSourceARP:
-			cj.Source = "ARP"
-		case ClientSourceWHOIS:
-			cj.Source = "WHOIS"
+			Name:   rc.Host,
+			Source: rc.Source,
+			IP:     ip,
 		}
 
 		data.RuntimeClients = append(data.RuntimeClients, cj)
-
-		return true
-	})
+	}
 
 	data.Tags = clientTags
 
-	w.Header().Set("Content-Type", "application/json")
-	e := json.NewEncoder(w).Encode(data)
-	if e != nil {
-		httpError(w, http.StatusInternalServerError, "Failed to encode to json: %v", e)
-		return
-	}
+	_ = aghhttp.WriteJSONResponse(w, r, data)
 }
 
-// Convert JSON object to Client object
-func jsonToClient(cj clientJSON) (c *Client) {
-	return &Client{
-		Name:                cj.Name,
-		IDs:                 cj.IDs,
-		Tags:                cj.Tags,
-		UseOwnSettings:      !cj.UseGlobalSettings,
-		FilteringEnabled:    cj.FilteringEnabled,
-		ParentalEnabled:     cj.ParentalEnabled,
-		SafeSearchEnabled:   cj.SafeSearchEnabled,
-		SafeBrowsingEnabled: cj.SafeBrowsingEnabled,
+// jsonToClient converts JSON object to Client object.
+func (clients *clientsContainer) jsonToClient(cj clientJSON, prev *Client) (c *Client, err error) {
+	var safeSearchConf filtering.SafeSearchConfig
+	if cj.SafeSearchConf != nil {
+		safeSearchConf = *cj.SafeSearchConf
+	} else {
+		// TODO(d.kolyshev): Remove after cleaning the deprecated
+		// [clientJSON.SafeSearchEnabled] field.
+		safeSearchConf = filtering.SafeSearchConfig{
+			Enabled: cj.SafeSearchEnabled,
+		}
 
+		// Set default service flags for enabled safesearch.
+		if safeSearchConf.Enabled {
+			safeSearchConf.Bing = true
+			safeSearchConf.DuckDuckGo = true
+			safeSearchConf.Google = true
+			safeSearchConf.Pixabay = true
+			safeSearchConf.Yandex = true
+			safeSearchConf.YouTube = true
+		}
+	}
+
+	c = &Client{
+		safeSearchConf: safeSearchConf,
+
+		Name: cj.Name,
+
+		IDs:             cj.IDs,
+		Tags:            cj.Tags,
+		BlockedServices: cj.BlockedServices,
+		Upstreams:       cj.Upstreams,
+
+		UseOwnSettings:        !cj.UseGlobalSettings,
+		FilteringEnabled:      cj.FilteringEnabled,
+		ParentalEnabled:       cj.ParentalEnabled,
+		SafeBrowsingEnabled:   cj.SafeBrowsingEnabled,
 		UseOwnBlockedServices: !cj.UseGlobalBlockedServices,
-		BlockedServices:       cj.BlockedServices,
-
-		Upstreams: cj.Upstreams,
 	}
+
+	if cj.IgnoreQueryLog != aghalg.NBNull {
+		c.IgnoreQueryLog = cj.IgnoreQueryLog == aghalg.NBTrue
+	} else if prev != nil {
+		c.IgnoreQueryLog = prev.IgnoreQueryLog
+	}
+
+	if cj.IgnoreStatistics != aghalg.NBNull {
+		c.IgnoreStatistics = cj.IgnoreStatistics == aghalg.NBTrue
+	} else if prev != nil {
+		c.IgnoreStatistics = prev.IgnoreStatistics
+	}
+
+	if safeSearchConf.Enabled {
+		err = c.setSafeSearch(
+			safeSearchConf,
+			clients.safeSearchCacheSize,
+			clients.safeSearchCacheTTL,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("creating safesearch for client %q: %w", c.Name, err)
+		}
+	}
+
+	return c, nil
 }
 
-// Convert Client object to JSON
+// clientToJSON converts Client object to JSON.
 func clientToJSON(c *Client) (cj *clientJSON) {
+	// TODO(d.kolyshev): Remove after cleaning the deprecated
+	// [clientJSON.SafeSearchEnabled] field.
+	cloneVal := c.safeSearchConf
+	safeSearchConf := &cloneVal
+
 	return &clientJSON{
 		Name:                c.Name,
 		IDs:                 c.IDs,
@@ -139,58 +173,72 @@ func clientToJSON(c *Client) (cj *clientJSON) {
 		UseGlobalSettings:   !c.UseOwnSettings,
 		FilteringEnabled:    c.FilteringEnabled,
 		ParentalEnabled:     c.ParentalEnabled,
-		SafeSearchEnabled:   c.SafeSearchEnabled,
+		SafeSearchEnabled:   safeSearchConf.Enabled,
+		SafeSearchConf:      safeSearchConf,
 		SafeBrowsingEnabled: c.SafeBrowsingEnabled,
 
 		UseGlobalBlockedServices: !c.UseOwnBlockedServices,
 		BlockedServices:          c.BlockedServices,
 
 		Upstreams: c.Upstreams,
+
+		IgnoreQueryLog:   aghalg.BoolToNullBool(c.IgnoreQueryLog),
+		IgnoreStatistics: aghalg.BoolToNullBool(c.IgnoreStatistics),
 	}
 }
 
-// Add a new client
+// handleAddClient is the handler for POST /control/clients/add HTTP API.
 func (clients *clientsContainer) handleAddClient(w http.ResponseWriter, r *http.Request) {
 	cj := clientJSON{}
 	err := json.NewDecoder(r.Body).Decode(&cj)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "failed to process request body: %s", err)
+		aghhttp.Error(r, w, http.StatusBadRequest, "failed to process request body: %s", err)
 
 		return
 	}
 
-	c := jsonToClient(cj)
+	c, err := clients.jsonToClient(cj, nil)
+	if err != nil {
+		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
+
+		return
+	}
+
 	ok, err := clients.Add(c)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "%s", err)
+		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
+
 		return
 	}
+
 	if !ok {
-		httpError(w, http.StatusBadRequest, "Client already exists")
+		aghhttp.Error(r, w, http.StatusBadRequest, "Client already exists")
+
 		return
 	}
 
 	onConfigModified()
 }
 
-// Remove client
+// handleDelClient is the handler for POST /control/clients/delete HTTP API.
 func (clients *clientsContainer) handleDelClient(w http.ResponseWriter, r *http.Request) {
 	cj := clientJSON{}
 	err := json.NewDecoder(r.Body).Decode(&cj)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "failed to process request body: %s", err)
+		aghhttp.Error(r, w, http.StatusBadRequest, "failed to process request body: %s", err)
 
 		return
 	}
 
 	if len(cj.Name) == 0 {
-		httpError(w, http.StatusBadRequest, "client's name must be non-empty")
+		aghhttp.Error(r, w, http.StatusBadRequest, "client's name must be non-empty")
 
 		return
 	}
 
 	if !clients.Del(cj.Name) {
-		httpError(w, http.StatusBadRequest, "Client not found")
+		aghhttp.Error(r, w, http.StatusBadRequest, "Client not found")
+
 		return
 	}
 
@@ -202,32 +250,56 @@ type updateJSON struct {
 	Data clientJSON `json:"data"`
 }
 
-// Update client's properties
+// handleUpdateClient is the handler for POST /control/clients/update HTTP API.
+//
+// TODO(s.chzhen):  Accept updated parameters instead of whole structure.
 func (clients *clientsContainer) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
 	dj := updateJSON{}
 	err := json.NewDecoder(r.Body).Decode(&dj)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "failed to process request body: %s", err)
+		aghhttp.Error(r, w, http.StatusBadRequest, "failed to process request body: %s", err)
 
 		return
 	}
 
 	if len(dj.Name) == 0 {
-		httpError(w, http.StatusBadRequest, "Invalid request")
+		aghhttp.Error(r, w, http.StatusBadRequest, "Invalid request")
+
 		return
 	}
 
-	c := jsonToClient(dj.Data)
+	var prev *Client
+	var ok bool
+
+	func() {
+		clients.lock.Lock()
+		defer clients.lock.Unlock()
+
+		prev, ok = clients.list[dj.Name]
+	}()
+
+	if !ok {
+		aghhttp.Error(r, w, http.StatusBadRequest, "client not found")
+	}
+
+	c, err := clients.jsonToClient(dj.Data, prev)
+	if err != nil {
+		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
+
+		return
+	}
+
 	err = clients.Update(dj.Name, c)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "%s", err)
+		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
+
 		return
 	}
 
 	onConfigModified()
 }
 
-// Get the list of clients by IP address list
+// handleFindClient is the handler for GET /control/clients/find HTTP API.
 func (clients *clientsContainer) handleFindClient(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	data := []map[string]*clientJSON{}
@@ -237,7 +309,7 @@ func (clients *clientsContainer) handleFindClient(w http.ResponseWriter, r *http
 			break
 		}
 
-		ip := net.ParseIP(idStr)
+		ip, _ := netip.ParseAddr(idStr)
 		c, ok := clients.Find(idStr)
 		var cj *clientJSON
 		if !ok {
@@ -253,22 +325,18 @@ func (clients *clientsContainer) handleFindClient(w http.ResponseWriter, r *http
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	err := json.NewEncoder(w).Encode(data)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "Couldn't write response: %s", err)
-	}
+	_ = aghhttp.WriteJSONResponse(w, r, data)
 }
 
 // findRuntime looks up the IP in runtime and temporary storages, like
 // /etc/hosts tables, DHCP leases, or blocklists.  cj is guaranteed to be
 // non-nil.
-func (clients *clientsContainer) findRuntime(ip net.IP, idStr string) (cj *clientJSON) {
-	rc, ok := clients.FindRuntimeClient(ip)
+func (clients *clientsContainer) findRuntime(ip netip.Addr, idStr string) (cj *clientJSON) {
+	rc, ok := clients.findRuntimeClient(ip)
 	if !ok {
-		// It is still possible that the IP used to be in the runtime
-		// clients list, but then the server was reloaded.  So, check
-		// the DNS server's blocked IP list.
+		// It is still possible that the IP used to be in the runtime clients
+		// list, but then the server was reloaded.  So, check the DNS server's
+		// blocked IP list.
 		//
 		// See https://github.com/AdguardTeam/AdGuardHome/issues/2428.
 		disallowed, rule := clients.dnsServer.IsBlockedClient(ip, idStr)

@@ -1,47 +1,34 @@
 package querylog
 
 import (
-	"fmt"
-	"net"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/miekg/dns"
+	"golang.org/x/exp/slices"
 	"golang.org/x/net/idna"
 )
 
 // TODO(a.garipov): Use a proper structured approach here.
 
-// Get Client IP address
-func (l *queryLog) getClientIP(ip net.IP) (clientIP net.IP) {
-	if l.conf.AnonymizeClientIP && ip != nil {
-		const AnonymizeClientIPv4Mask = 16
-		const AnonymizeClientIPv6Mask = 112
-
-		if ip.To4() != nil {
-			return ip.Mask(net.CIDRMask(AnonymizeClientIPv4Mask, 32))
-		}
-
-		return ip.Mask(net.CIDRMask(AnonymizeClientIPv6Mask, 128))
-	}
-
-	return ip
-}
-
 // jobject is a JSON object alias.
-type jobject = map[string]interface{}
+type jobject = map[string]any
 
 // entriesToJSON converts query log entries to JSON.
-func (l *queryLog) entriesToJSON(entries []*logEntry, oldest time.Time) (res jobject) {
-	data := []jobject{}
+func entriesToJSON(
+	entries []*logEntry,
+	oldest time.Time,
+	anonFunc aghnet.IPMutFunc,
+) (res jobject) {
+	data := make([]jobject, 0, len(entries))
 
-	// the elements order is already reversed (from newer to older)
-	for i := 0; i < len(entries); i++ {
-		entry := entries[i]
-		jsonEntry := l.logEntryToJSONEntry(entry)
+	// The elements order is already reversed to be from newer to older.
+	for _, entry := range entries {
+		jsonEntry := entryToJSON(entry, anonFunc)
 		data = append(data, jsonEntry)
 	}
 
@@ -56,88 +43,105 @@ func (l *queryLog) entriesToJSON(entries []*logEntry, oldest time.Time) (res job
 	return res
 }
 
-func (l *queryLog) logEntryToJSONEntry(entry *logEntry) (jsonEntry jobject) {
-	var msg *dns.Msg
-
-	if len(entry.Answer) > 0 {
-		msg = new(dns.Msg)
-		if err := msg.Unpack(entry.Answer); err != nil {
-			log.Debug("Failed to unpack dns message answer: %s: %s", err, string(entry.Answer))
-			msg = nil
-		}
-	}
-
+// entryToJSON converts a log entry's data into an entry for the JSON API.
+func entryToJSON(entry *logEntry, anonFunc aghnet.IPMutFunc) (jsonEntry jobject) {
 	hostname := entry.QHost
 	question := jobject{
 		"type":  entry.QType,
 		"class": entry.QClass,
 		"name":  hostname,
 	}
-	if qhost, err := idna.ToUnicode(hostname); err == nil {
-		if qhost != hostname && qhost != "" {
-			question["unicode_name"] = qhost
-		}
-	} else {
-		log.Debug("translating %q into unicode: %s", hostname, err)
+
+	if qhost, err := idna.ToUnicode(hostname); err != nil {
+		log.Debug("querylog: translating %q into unicode: %s", hostname, err)
+	} else if qhost != hostname && qhost != "" {
+		question["unicode_name"] = qhost
 	}
+
+	entIP := slices.Clone(entry.IP)
+	anonFunc(entIP)
 
 	jsonEntry = jobject{
 		"reason":       entry.Result.Reason.String(),
 		"elapsedMs":    strconv.FormatFloat(entry.Elapsed.Seconds()*1000, 'f', -1, 64),
 		"time":         entry.Time.Format(time.RFC3339Nano),
-		"client":       l.getClientIP(entry.IP),
-		"client_info":  entry.client,
+		"client":       entIP,
 		"client_proto": entry.ClientProto,
+		"cached":       entry.Cached,
 		"upstream":     entry.Upstream,
 		"question":     question,
+		"rules":        resultRulesToJSONRules(entry.Result.Rules),
+	}
+
+	if entIP.Equal(entry.IP) {
+		jsonEntry["client_info"] = entry.client
 	}
 
 	if entry.ClientID != "" {
 		jsonEntry["client_id"] = entry.ClientID
 	}
 
-	if msg != nil {
-		jsonEntry["status"] = dns.RcodeToString[msg.Rcode]
-
-		opt := msg.IsEdns0()
-		dnssecOk := false
-		if opt != nil {
-			dnssecOk = opt.Do()
-		}
-
-		jsonEntry["answer_dnssec"] = dnssecOk
+	if entry.ReqECS != "" {
+		jsonEntry["ecs"] = entry.ReqECS
 	}
 
-	jsonEntry["rules"] = resultRulesToJSONRules(entry.Result.Rules)
-
-	if len(entry.Result.Rules) > 0 && len(entry.Result.Rules[0].Text) > 0 {
-		jsonEntry["rule"] = entry.Result.Rules[0].Text
-		jsonEntry["filterId"] = entry.Result.Rules[0].FilterListID
+	if len(entry.Result.Rules) > 0 {
+		if r := entry.Result.Rules[0]; len(r.Text) > 0 {
+			jsonEntry["rule"] = r.Text
+			jsonEntry["filterId"] = r.FilterListID
+		}
 	}
 
 	if len(entry.Result.ServiceName) != 0 {
 		jsonEntry["service_name"] = entry.Result.ServiceName
 	}
 
-	answers := answerToMap(msg)
-	if answers != nil {
-		jsonEntry["answer"] = answers
-	}
-
-	if len(entry.OrigAnswer) != 0 {
-		a := new(dns.Msg)
-		err := a.Unpack(entry.OrigAnswer)
-		if err == nil {
-			answers = answerToMap(a)
-			if answers != nil {
-				jsonEntry["original_answer"] = answers
-			}
-		} else {
-			log.Debug("Querylog: msg.Unpack(entry.OrigAnswer): %s: %s", err, string(entry.OrigAnswer))
-		}
-	}
+	setMsgData(entry, jsonEntry)
+	setOrigAns(entry, jsonEntry)
 
 	return jsonEntry
+}
+
+// setMsgData sets the message data in jsonEntry.
+func setMsgData(entry *logEntry, jsonEntry jobject) {
+	if len(entry.Answer) == 0 {
+		return
+	}
+
+	msg := &dns.Msg{}
+	if err := msg.Unpack(entry.Answer); err != nil {
+		log.Debug("querylog: failed to unpack dns msg answer: %v: %s", entry.Answer, err)
+
+		return
+	}
+
+	jsonEntry["status"] = dns.RcodeToString[msg.Rcode]
+	// Old query logs may still keep AD flag value in the message.  Try to get
+	// it from there as well.
+	jsonEntry["answer_dnssec"] = entry.AuthenticatedData || msg.AuthenticatedData
+
+	if a := answerToJSON(msg); a != nil {
+		jsonEntry["answer"] = a
+	}
+}
+
+// setOrigAns sets the original answer data in jsonEntry.
+func setOrigAns(entry *logEntry, jsonEntry jobject) {
+	if len(entry.OrigAnswer) == 0 {
+		return
+	}
+
+	orig := &dns.Msg{}
+	err := orig.Unpack(entry.OrigAnswer)
+	if err != nil {
+		log.Debug("querylog: orig.Unpack(entry.OrigAnswer): %v: %s", entry.OrigAnswer, err)
+
+		return
+	}
+
+	if a := answerToJSON(orig); a != nil {
+		jsonEntry["original_answer"] = a
+	}
 }
 
 func resultRulesToJSONRules(rules []*filtering.ResultRule) (jsonRules []jobject) {
@@ -158,55 +162,24 @@ type dnsAnswer struct {
 	TTL   uint32 `json:"ttl"`
 }
 
-func answerToMap(a *dns.Msg) (answers []*dnsAnswer) {
-	if a == nil || len(a.Answer) == 0 {
+// answerToJSON converts the answer records of msg, if any, to their JSON form.
+func answerToJSON(msg *dns.Msg) (answers []*dnsAnswer) {
+	if msg == nil || len(msg.Answer) == 0 {
 		return nil
 	}
 
-	answers = make([]*dnsAnswer, 0, len(a.Answer))
-	for _, k := range a.Answer {
-		header := k.Header()
-		answer := &dnsAnswer{
+	answers = make([]*dnsAnswer, 0, len(msg.Answer))
+	for _, rr := range msg.Answer {
+		header := rr.Header()
+		a := &dnsAnswer{
 			Type: dns.TypeToString[header.Rrtype],
-			TTL:  header.Ttl,
+			// Remove the header string from the answer value since it's mostly
+			// unnecessary in the log.
+			Value: strings.TrimPrefix(rr.String(), header.String()),
+			TTL:   header.Ttl,
 		}
 
-		// Some special treatment for some well-known types.
-		//
-		// TODO(a.garipov): Consider just calling String() for everyone
-		// instead.
-		switch v := k.(type) {
-		case nil:
-			// Probably unlikely, but go on.
-		case *dns.A:
-			answer.Value = v.A.String()
-		case *dns.AAAA:
-			answer.Value = v.AAAA.String()
-		case *dns.MX:
-			answer.Value = fmt.Sprintf("%v %v", v.Preference, v.Mx)
-		case *dns.CNAME:
-			answer.Value = v.Target
-		case *dns.NS:
-			answer.Value = v.Ns
-		case *dns.SPF:
-			answer.Value = strings.Join(v.Txt, "\n")
-		case *dns.TXT:
-			answer.Value = strings.Join(v.Txt, "\n")
-		case *dns.PTR:
-			answer.Value = v.Ptr
-		case *dns.SOA:
-			answer.Value = fmt.Sprintf("%v %v %v %v %v %v %v", v.Ns, v.Mbox, v.Serial, v.Refresh, v.Retry, v.Expire, v.Minttl)
-		case *dns.CAA:
-			answer.Value = fmt.Sprintf("%v %v \"%v\"", v.Flag, v.Tag, v.Value)
-		case *dns.HINFO:
-			answer.Value = fmt.Sprintf("\"%v\" \"%v\"", v.Cpu, v.Os)
-		case *dns.RRSIG:
-			answer.Value = fmt.Sprintf("%v %v %v %v %v %v %v %v %v", dns.TypeToString[v.TypeCovered], v.Algorithm, v.Labels, v.OrigTtl, v.Expiration, v.Inception, v.KeyTag, v.SignerName, v.Signature)
-		default:
-			answer.Value = v.String()
-		}
-
-		answers = append(answers, answer)
+		answers = append(answers, a)
 	}
 
 	return answers

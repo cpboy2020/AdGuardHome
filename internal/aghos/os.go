@@ -17,6 +17,8 @@ import (
 
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/mathutil"
+	"golang.org/x/exp/slices"
 )
 
 // UnsupportedError is returned by functions and methods when a particular
@@ -52,24 +54,26 @@ func HaveAdminRights() (bool, error) {
 	return haveAdminRights()
 }
 
-// MaxCmdOutputSize is the maximum length of performed shell command output.
-const MaxCmdOutputSize = 2 * 1024
+// MaxCmdOutputSize is the maximum length of performed shell command output in
+// bytes.
+const MaxCmdOutputSize = 64 * 1024
 
 // RunCommand runs shell command.
-func RunCommand(command string, arguments ...string) (int, string, error) {
+func RunCommand(command string, arguments ...string) (code int, output []byte, err error) {
 	cmd := exec.Command(command, arguments...)
 	out, err := cmd.Output()
-	if len(out) > MaxCmdOutputSize {
-		out = out[:MaxCmdOutputSize]
+
+	out = out[:mathutil.Min(len(out), MaxCmdOutputSize)]
+
+	if err != nil {
+		if eerr := new(exec.ExitError); errors.As(err, &eerr) {
+			return eerr.ExitCode(), eerr.Stderr, nil
+		}
+
+		return 1, nil, fmt.Errorf("command %q failed: %w: %s", command, err, out)
 	}
 
-	if errors.As(err, new(*exec.ExitError)) {
-		return cmd.ProcessState.ExitCode(), string(out), nil
-	} else if err != nil {
-		return 1, "", fmt.Errorf("exec.Command(%s) failed: %w: %s", command, err, string(out))
-	}
-
-	return cmd.ProcessState.ExitCode(), string(out), nil
+	return cmd.ProcessState.ExitCode(), out, nil
 }
 
 // PIDByCommand searches for process named command and returns its PID ignoring
@@ -91,7 +95,7 @@ func PIDByCommand(command string, except ...int) (pid int, err error) {
 	}
 
 	var instNum int
-	pid, instNum, err = parsePSOutput(stdout, command, except...)
+	pid, instNum, err = parsePSOutput(stdout, command, except)
 	if err != nil {
 		return 0, err
 	}
@@ -118,16 +122,14 @@ func PIDByCommand(command string, except ...int) (pid int, err error) {
 }
 
 // parsePSOutput scans the output of ps searching the largest PID of the process
-// associated with cmdName ignoring PIDs from ignore.  Valid r's line shoud be
-// like:
+// associated with cmdName ignoring PIDs from ignore.  A valid line from r
+// should look like these:
 //
-//    123 ./example-cmd
-//   1230 some/base/path/example-cmd
-//   3210 example-cmd
-//
-func parsePSOutput(r io.Reader, cmdName string, ignore ...int) (largest, instNum int, err error) {
+//	 123 ./example-cmd
+//	1230 some/base/path/example-cmd
+//	3210 example-cmd
+func parsePSOutput(r io.Reader, cmdName string, ignore []int) (largest, instNum int, err error) {
 	s := bufio.NewScanner(r)
-ScanLoop:
 	for s.Scan() {
 		fields := strings.Fields(s.Text())
 		if len(fields) != 2 || path.Base(fields[1]) != cmdName {
@@ -135,20 +137,12 @@ ScanLoop:
 		}
 
 		cur, aerr := strconv.Atoi(fields[0])
-		if aerr != nil || cur < 0 {
+		if aerr != nil || cur < 0 || slices.Contains(ignore, cur) {
 			continue
 		}
 
-		for _, pid := range ignore {
-			if cur == pid {
-				continue ScanLoop
-			}
-		}
-
 		instNum++
-		if cur > largest {
-			largest = cur
-		}
+		largest = mathutil.Max(largest, cur)
 	}
 	if err = s.Err(); err != nil {
 		return 0, 0, fmt.Errorf("scanning stdout: %w", err)
@@ -162,9 +156,29 @@ func IsOpenWrt() (ok bool) {
 	return isOpenWrt()
 }
 
-// RootDirFS returns the fs.FS rooted at the operating system's root.
+// RootDirFS returns the [fs.FS] rooted at the operating system's root.  On
+// Windows it returns the fs.FS rooted at the volume of the system directory
+// (usually, C:).
 func RootDirFS() (fsys fs.FS) {
-	// Use empty string since os.DirFS implicitly prepends a slash to it.  This
-	// behavior is undocumented but it currently works.
-	return os.DirFS("")
+	return rootDirFS()
+}
+
+// NotifyReconfigureSignal notifies c on receiving reconfigure signals.
+func NotifyReconfigureSignal(c chan<- os.Signal) {
+	notifyReconfigureSignal(c)
+}
+
+// NotifyShutdownSignal notifies c on receiving shutdown signals.
+func NotifyShutdownSignal(c chan<- os.Signal) {
+	notifyShutdownSignal(c)
+}
+
+// IsReconfigureSignal returns true if sig is a reconfigure signal.
+func IsReconfigureSignal(sig os.Signal) (ok bool) {
+	return isReconfigureSignal(sig)
+}
+
+// IsShutdownSignal returns true if sig is a shutdown signal.
+func IsShutdownSignal(sig os.Signal) (ok bool) {
+	return isShutdownSignal(sig)
 }

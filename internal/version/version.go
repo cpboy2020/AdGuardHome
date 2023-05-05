@@ -7,6 +7,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/AdguardTeam/golibs/stringutil"
 )
@@ -26,11 +27,11 @@ const (
 // TODO(a.garipov): Find out if we can get GOARM and GOMIPS values the same way
 // we can GOARCH and GOOS.
 var (
-	channel   string = ChannelDevelopment
-	goarm     string
-	gomips    string
-	version   string
-	buildtime string
+	channel    string = ChannelDevelopment
+	goarm      string
+	gomips     string
+	version    string
+	committime string
 )
 
 // Channel returns the current AdGuard Home release channel.
@@ -62,26 +63,9 @@ func Version() (v string) {
 	return version
 }
 
-// Common formatting constants.
-const (
-	sp   = " "
-	nl   = "\n"
-	tb   = "\t"
-	nltb = nl + tb
-)
-
-// Constants defining the format of module information string.
-const (
-	modInfoAtSep    = "@"
-	modInfoDevSep   = sp
-	modInfoSumLeft  = " (sum: "
-	modInfoSumRight = ")"
-)
-
 // fmtModule returns formatted information about module.  The result looks like:
 //
-//   github.com/Username/module@v1.2.3 (sum: someHASHSUM=)
-//
+//	github.com/Username/module@v1.2.3 (sum: someHASHSUM=)
 func fmtModule(m *debug.Module) (formatted string) {
 	if m == nil {
 		return ""
@@ -95,14 +79,16 @@ func fmtModule(m *debug.Module) (formatted string) {
 
 	stringutil.WriteToBuilder(b, m.Path)
 	if ver := m.Version; ver != "" {
-		sep := modInfoAtSep
+		sep := "@"
 		if ver == "(devel)" {
-			sep = modInfoDevSep
+			sep = " "
 		}
+
 		stringutil.WriteToBuilder(b, sep, ver)
 	}
+
 	if sum := m.Sum; sum != "" {
-		stringutil.WriteToBuilder(b, modInfoSumLeft, sum, modInfoSumRight)
+		stringutil.WriteToBuilder(b, "(sum: ", sum, ")")
 	}
 
 	return b.String()
@@ -114,7 +100,7 @@ const (
 	vFmtVerHdr    = "Version: "
 	vFmtChanHdr   = "Channel: "
 	vFmtGoHdr     = "Go version: "
-	vFmtTimeHdr   = "Build time: "
+	vFmtTimeHdr   = "Commit time: "
 	vFmtRaceHdr   = "Race: "
 	vFmtGOOSHdr   = "GOOS: " + runtime.GOOS
 	vFmtGOARCHHdr = "GOARCH: " + runtime.GOARCH
@@ -125,23 +111,24 @@ const (
 
 // Verbose returns formatted build information.  Output example:
 //
-//   AdGuard Home
-//   Version: v0.105.3
-//   Channel: development
-//   Go version: go1.15.3
-//   Build time: 2021-03-30T16:26:08Z+0300
-//   GOOS: darwin
-//   GOARCH: amd64
-//   Race: false
-//   Main module:
-//           ...
-//   Dependencies:
-//           ...
+//	AdGuard Home
+//	Version: v0.105.3
+//	Channel: development
+//	Go version: go1.15.3
+//	Build time: 2021-03-30T16:26:08Z+0300
+//	GOOS: darwin
+//	GOARCH: amd64
+//	Race: false
+//	Main module:
+//	        ...
+//	Dependencies:
+//	        ...
 //
 // TODO(e.burkov): Make it write into passed io.Writer.
 func Verbose() (v string) {
 	b := &strings.Builder{}
 
+	const nl = "\n"
 	stringutil.WriteToBuilder(
 		b,
 		vFmtAGHHdr,
@@ -155,15 +142,23 @@ func Verbose() (v string) {
 		vFmtGoHdr,
 		runtime.Version(),
 	)
-	if buildtime != "" {
-		stringutil.WriteToBuilder(b, nl, vFmtTimeHdr, buildtime)
+
+	if committime != "" {
+		commitTimeUnix, err := strconv.ParseInt(committime, 10, 64)
+		if err != nil {
+			stringutil.WriteToBuilder(b, nl, vFmtTimeHdr, fmt.Sprintf("parse error: %s", err))
+		} else {
+			stringutil.WriteToBuilder(b, nl, vFmtTimeHdr, time.Unix(commitTimeUnix, 0).String())
+		}
 	}
+
 	stringutil.WriteToBuilder(b, nl, vFmtGOOSHdr, nl, vFmtGOARCHHdr)
 	if goarm != "" {
 		stringutil.WriteToBuilder(b, nl, vFmtGOARMHdr, "v", goarm)
 	} else if gomips != "" {
 		stringutil.WriteToBuilder(b, nl, vFmtGOMIPSHdr, gomips)
 	}
+
 	stringutil.WriteToBuilder(b, nl, vFmtRaceHdr, strconv.FormatBool(isRace))
 
 	info, ok := debug.ReadBuildInfo()
@@ -178,7 +173,7 @@ func Verbose() (v string) {
 	stringutil.WriteToBuilder(b, nl, vFmtDepsHdr)
 	for _, dep := range info.Deps {
 		if depStr := fmtModule(dep); depStr != "" {
-			stringutil.WriteToBuilder(b, nltb, depStr)
+			stringutil.WriteToBuilder(b, "\n\t", depStr)
 		}
 	}
 

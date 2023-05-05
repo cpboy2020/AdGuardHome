@@ -2,12 +2,13 @@ package home
 
 import (
 	"encoding/binary"
-	"net"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/dnsforward"
 	"github.com/AdguardTeam/golibs/cache"
+	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
 )
 
@@ -16,26 +17,29 @@ type RDNS struct {
 	exchanger dnsforward.RDNSExchanger
 	clients   *clientsContainer
 
-	// usePrivate is used to store the state of current private RDNS
-	// resolving settings and to react to it's changes.
-	usePrivate uint32
-
 	// ipCh used to pass client's IP to rDNS workerLoop.
-	ipCh chan net.IP
+	ipCh chan netip.Addr
 
 	// ipCache caches the IP addresses to be resolved by rDNS.  The resolved
-	// address stays here while it's inside clients.  After leaving clients
-	// the address will be resolved once again.  If the address couldn't be
-	// resolved, cache prevents further attempts to resolve it for some
-	// time.
+	// address stays here while it's inside clients.  After leaving clients the
+	// address will be resolved once again.  If the address couldn't be
+	// resolved, cache prevents further attempts to resolve it for some time.
 	ipCache cache.Cache
+
+	// usePrivate stores the state of current private reverse-DNS resolving
+	// settings.
+	usePrivate atomic.Bool
 }
 
-// Default rDNS values.
+// Default AdGuard Home reverse DNS values.
 const (
-	defaultRDNSCacheSize = 10000
-	defaultRDNSCacheTTL  = 1 * 60 * 60
-	defaultRDNSIPChSize  = 256
+	revDNSCacheSize = 10000
+
+	// TODO(e.burkov):  Make these values configurable.
+	revDNSCacheTTL        = 24 * 60 * 60
+	revDNSFailureCacheTTL = 1 * 60 * 60
+
+	revDNSQueueSize = 256
 )
 
 // NewRDNS creates and returns initialized RDNS.
@@ -49,13 +53,12 @@ func NewRDNS(
 		clients:   clients,
 		ipCache: cache.New(cache.Config{
 			EnableLRU: true,
-			MaxCount:  defaultRDNSCacheSize,
+			MaxCount:  revDNSCacheSize,
 		}),
-		ipCh: make(chan net.IP, defaultRDNSIPChSize),
+		ipCh: make(chan netip.Addr, revDNSQueueSize),
 	}
-	if usePrivate {
-		rDNS.usePrivate = 1
-	}
+
+	rDNS.usePrivate.Store(usePrivate)
 
 	go rDNS.workerLoop()
 
@@ -69,48 +72,48 @@ func NewRDNS(
 // approach since only unresolved locally-served addresses should be removed.
 // Implement when improving the cache.
 func (r *RDNS) ensurePrivateCache() {
-	var usePrivate uint32
-	if r.exchanger.ResolvesPrivatePTR() {
-		usePrivate = 1
-	}
-
-	if atomic.CompareAndSwapUint32(&r.usePrivate, 1-usePrivate, usePrivate) {
+	usePrivate := r.exchanger.ResolvesPrivatePTR()
+	if r.usePrivate.CompareAndSwap(!usePrivate, usePrivate) {
 		r.ipCache.Clear()
 	}
 }
 
 // isCached returns true if ip is already cached and not expired yet.  It also
 // caches it otherwise.
-func (r *RDNS) isCached(ip net.IP) (ok bool) {
+func (r *RDNS) isCached(ip netip.Addr) (ok bool) {
+	ipBytes := ip.AsSlice()
 	now := uint64(time.Now().Unix())
-	if expire := r.ipCache.Get(ip); len(expire) != 0 {
-		if binary.BigEndian.Uint64(expire) > now {
-			return true
-		}
+	if expire := r.ipCache.Get(ipBytes); len(expire) != 0 {
+		return binary.BigEndian.Uint64(expire) > now
 	}
-
-	// The cache entry either expired or doesn't exist.
-	ttl := make([]byte, 8)
-	binary.BigEndian.PutUint64(ttl, now+defaultRDNSCacheTTL)
-	r.ipCache.Set(ip, ttl)
 
 	return false
 }
 
+// cache caches the ip address for ttl seconds.
+func (r *RDNS) cache(ip netip.Addr, ttl uint64) {
+	ipData := ip.AsSlice()
+
+	ttlData := [8]byte{}
+	binary.BigEndian.PutUint64(ttlData[:], uint64(time.Now().Unix())+ttl)
+
+	r.ipCache.Set(ipData, ttlData[:])
+}
+
 // Begin adds the ip to the resolving queue if it is not cached or already
 // resolved.
-func (r *RDNS) Begin(ip net.IP) {
+func (r *RDNS) Begin(ip netip.Addr) {
 	r.ensurePrivateCache()
 
-	if r.isCached(ip) || r.clients.Exists(ip, ClientSourceRDNS) {
+	if r.isCached(ip) || r.clients.clientSource(ip) > ClientSourceRDNS {
 		return
 	}
 
 	select {
 	case r.ipCh <- ip:
-		log.Tracef("rdns: %q added to queue", ip)
+		log.Debug("rdns: %q added to queue", ip)
 	default:
-		log.Tracef("rdns: queue is full")
+		log.Debug("rdns: queue is full")
 	}
 }
 
@@ -120,19 +123,21 @@ func (r *RDNS) workerLoop() {
 	defer log.OnPanic("rdns")
 
 	for ip := range r.ipCh {
-		host, err := r.exchanger.Exchange(ip)
+		ttl := uint64(revDNSCacheTTL)
+
+		host, err := r.exchanger.Exchange(ip.AsSlice())
 		if err != nil {
 			log.Debug("rdns: resolving %q: %s", ip, err)
-
-			continue
+			if errors.Is(err, dnsforward.ErrRDNSFailed) {
+				// Cache failure for a less time.
+				ttl = revDNSFailureCacheTTL
+			}
 		}
 
-		if host == "" {
-			continue
-		}
+		r.cache(ip, ttl)
 
-		// Don't handle any errors since AddHost doesn't return non-nil
-		// errors for now.
-		_, _ = r.clients.AddHost(ip, host, ClientSourceRDNS)
+		if host != "" {
+			_ = r.clients.AddHost(ip, host, ClientSourceRDNS)
+		}
 	}
 }

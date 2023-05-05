@@ -2,7 +2,7 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { Field, reduxForm } from 'redux-form';
 import { Trans, useTranslation } from 'react-i18next';
-import { useDispatch } from 'react-redux';
+import { useDispatch, useSelector, shallowEqual } from 'react-redux';
 
 import { renderInputField, normalizeMac } from '../../../../helpers/form';
 import {
@@ -10,6 +10,7 @@ import {
     validateMac,
     validateRequiredValue,
     validateIpv4InCidr,
+    validateIpGateway,
 } from '../../../../helpers/validators';
 import { FORM_NAME } from '../../../../helpers/constants';
 import { toggleLeaseModal } from '../../../../actions';
@@ -24,6 +25,7 @@ const Form = ({
 }) => {
     const { t } = useTranslation();
     const dispatch = useDispatch();
+    const dynamicLease = useSelector((store) => store.dhcp.leaseModalConfig, shallowEqual);
 
     const onClick = () => {
         reset();
@@ -57,6 +59,7 @@ const Form = ({
                             validateRequiredValue,
                             validateIpv4,
                             validateIpv4InCidr,
+                            validateIpGateway,
                         ]}
                     />
                 </div>
@@ -85,7 +88,7 @@ const Form = ({
                     <button
                         type="submit"
                         className="btn btn-success btn-standard"
-                        disabled={submitting || pristine || processingAdding}
+                        disabled={submitting || processingAdding || (pristine && !dynamicLease)}
                     >
                         <Trans>save_btn</Trans>
                     </button>
@@ -101,6 +104,7 @@ Form.propTypes = {
         ip: PropTypes.string.isRequired,
         hostname: PropTypes.string.isRequired,
         cidr: PropTypes.string.isRequired,
+        gatewayIp: PropTypes.string,
     }),
     pristine: PropTypes.bool.isRequired,
     handleSubmit: PropTypes.func.isRequired,

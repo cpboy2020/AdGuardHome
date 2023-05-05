@@ -8,6 +8,7 @@ import * as actionCreators from '../../actions/login';
 import logo from '../../components/ui/svg/logo.svg';
 import Toasts from '../../components/Toasts';
 import Footer from '../../components/ui/Footer';
+import Icons from '../../components/ui/Icons';
 import Form from './Form';
 
 import './Login.css';
@@ -36,7 +37,7 @@ class Login extends Component {
             <div className="login">
                 <div className="login__form">
                     <div className="text-center mb-6">
-                        <img src={logo} className="h-6" alt="logo" />
+                        <img src={logo} className="h-6 login__logo" alt="logo" />
                     </div>
                     <Form onSubmit={this.handleSubmit} processing={processingLogin} />
                     <div className="login__info">
@@ -69,6 +70,7 @@ class Login extends Component {
                 </div>
                 <Footer />
                 <Toasts />
+                <Icons />
             </div>
         );
     }

@@ -62,7 +62,7 @@ const ClientCell = ({
         'white-space--nowrap': isDetailed,
     });
 
-    const hintClass = classNames('icons mr-4 icon--24 icon--lightgray', {
+    const hintClass = classNames('icons mr-4 icon--24 logs__question icon--lightgray', {
         'my-3': isDetailed,
     });
 
@@ -121,7 +121,7 @@ const ClientCell = ({
                     {options.map(({ name, onClick, disabled }) => (
                         <button
                             key={name}
-                            className="button-action--arrow-option px-4 py-2"
+                            className="button-action--arrow-option px-4 py-1"
                             onClick={onClick}
                             disabled={disabled}
                         >
@@ -162,7 +162,7 @@ const ClientCell = ({
                 {content && (
                     <button className={buttonArrowClass} disabled={processingRules}>
                         <IconTooltip
-                            className="h-100"
+                            className="icon24"
                             tooltipClass="button-action--arrow-option-container"
                             xlinkHref="chevron-down"
                             triggerClass="button-action--icon"
@@ -199,7 +199,7 @@ const ClientCell = ({
                 {isDetailed && clientName && !whoisAvailable && (
                     <Link
                         className="detailed-info d-none d-sm-block logs__text logs__text--link"
-                        to={`logs?search=${encodeURIComponent(clientName)}`}
+                        to={`logs?search="${encodeURIComponent(clientName)}"`}
                         title={clientName}
                     >
                         {clientName}

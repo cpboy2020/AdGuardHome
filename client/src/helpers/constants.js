@@ -26,6 +26,8 @@ export const R_WIN_ABSOLUTE_PATH = /^([a-zA-Z]:)?(\\|\/)(?:[^\\/:*?"<>|\x00]+\\)
 
 export const R_CLIENT_ID = /^[a-z0-9-]{1,63}$/;
 
+export const MIN_PASSWORD_LENGTH = 8;
+
 export const HTML_PAGES = {
     INSTALL: '/install.html',
     LOGIN: '/login.html',
@@ -51,14 +53,15 @@ export const STATUS_COLORS = {
 export const REPOSITORY = {
     URL: 'https://github.com/AdguardTeam/AdGuardHome',
     TRACKERS_DB:
-        'https://github.com/AdguardTeam/AdGuardHome/tree/master/client/src/helpers/trackers/adguard.json',
+        'https://github.com/AdguardTeam/AdGuardHome/tree/master/client/src/helpers/trackers/trackers.json',
     ISSUES: 'https://github.com/AdguardTeam/AdGuardHome/issues/new/choose',
 };
 
-export const PRIVACY_POLICY_LINK = 'https://adguard.com/privacy/home.html';
+export const CLIENT_ID_LINK = 'https://github.com/AdguardTeam/AdGuardHome/wiki/Clients#clientid';
+export const MANUAL_UPDATE_LINK = 'https://github.com/AdguardTeam/AdGuardHome/wiki/FAQ#manual-update';
 export const PORT_53_FAQ_LINK = 'https://github.com/AdguardTeam/AdGuardHome/wiki/FAQ#bindinuse';
+export const PRIVACY_POLICY_LINK = 'https://link.adtidy.org/forward.html?action=privacy&from=ui&app=home';
 export const UPSTREAM_CONFIGURATION_WIKI_LINK = 'https://github.com/AdguardTeam/AdGuardHome/wiki/Configuration#upstreams';
-export const GETTING_STARTED_LINK = 'https://github.com/AdguardTeam/AdGuardHome/wiki/Getting-Started#update';
 
 export const FILTERS_RELATIVE_LINK = '#filters';
 
@@ -78,7 +81,7 @@ export const STANDARD_DNS_PORT = 53;
 export const STANDARD_WEB_PORT = 80;
 export const STANDARD_HTTPS_PORT = 443;
 export const DNS_OVER_TLS_PORT = 853;
-export const DNS_OVER_QUIC_PORT = 784;
+export const DNS_OVER_QUIC_PORT = 853;
 export const MAX_PORT = 65535;
 
 export const EMPTY_DATE = '0001-01-01T00:00:00Z';
@@ -199,154 +202,6 @@ export const FILTERS_URLS = {
     blocked_services: '/blocked_services',
 };
 
-export const SERVICES = [
-    {
-        id: '9gag',
-        name: '9GAG',
-    },
-    {
-        id: 'amazon',
-        name: 'Amazon',
-    },
-    {
-        id: 'cloudflare',
-        name: 'CloudFlare',
-    },
-    {
-        id: 'dailymotion',
-        name: 'Dailymotion',
-    },
-    {
-        id: 'discord',
-        name: 'Discord',
-    },
-    {
-        id: 'disneyplus',
-        name: 'Disney+',
-    },
-    {
-        id: 'ebay',
-        name: 'EBay',
-    },
-    {
-        id: 'epic_games',
-        name: 'Epic Games',
-    },
-    {
-        id: 'facebook',
-        name: 'Facebook',
-    },
-    {
-        id: 'hulu',
-        name: 'Hulu',
-    },
-    {
-        id: 'imgur',
-        name: 'Imgur',
-    },
-    {
-        id: 'instagram',
-        name: 'Instagram',
-    },
-    {
-        id: 'mail_ru',
-        name: 'Mail.ru',
-    },
-    {
-        id: 'netflix',
-        name: 'Netflix',
-    },
-    {
-        id: 'ok',
-        name: 'OK.ru',
-    },
-    {
-        id: 'origin',
-        name: 'Origin',
-    },
-    {
-        id: 'pinterest',
-        name: 'Pinterest',
-    },
-    {
-        id: 'qq',
-        name: 'QQ',
-    },
-    {
-        id: 'reddit',
-        name: 'Reddit',
-    },
-    {
-        id: 'skype',
-        name: 'Skype',
-    },
-    {
-        id: 'snapchat',
-        name: 'Snapchat',
-    },
-    {
-        id: 'spotify',
-        name: 'Spotify',
-    },
-    {
-        id: 'steam',
-        name: 'Steam',
-    },
-    {
-        id: 'telegram',
-        name: 'Telegram',
-    },
-    {
-        id: 'tiktok',
-        name: 'TikTok',
-    },
-    {
-        id: 'tinder',
-        name: 'Tinder',
-    },
-    {
-        id: 'twitch',
-        name: 'Twitch',
-    },
-    {
-        id: 'twitter',
-        name: 'Twitter',
-    },
-    {
-        id: 'viber',
-        name: 'Viber',
-    },
-    {
-        id: 'vimeo',
-        name: 'Vimeo',
-    },
-    {
-        id: 'vk',
-        name: 'VK.com',
-    },
-    {
-        id: 'wechat',
-        name: 'WeChat',
-    },
-    {
-        id: 'weibo',
-        name: 'Weibo',
-    },
-    {
-        id: 'whatsapp',
-        name: 'WhatsApp',
-    },
-    {
-        id: 'youtube',
-        name: 'YouTube',
-    },
-];
-
-export const SERVICES_ID_NAME_MAP = SERVICES.reduce((acc, { id, name }) => {
-    acc[id] = name;
-    return acc;
-}, {});
-
 export const ENCRYPTION_SOURCE = {
     PATH: 'path',
     CONTENT: 'content',
@@ -356,9 +211,20 @@ export const FILTERED = 'Filtered';
 export const NOT_FILTERED = 'NotFiltered';
 
 export const DISABLED_STATS_INTERVAL = 0;
-export const STATS_INTERVALS_DAYS = [1, 7, 30, 90];
 
-export const QUERY_LOG_INTERVALS_DAYS = [0.25, 1, 7, 30, 90];
+export const HOUR = 60 * 60 * 1000;
+
+export const DAY = HOUR * 24;
+
+export const STATS_INTERVALS_DAYS = [DAY, DAY * 7, DAY * 30, DAY * 90];
+
+export const QUERY_LOG_INTERVALS_DAYS = [HOUR * 6, DAY, DAY * 7, DAY * 30, DAY * 90];
+
+export const RETENTION_CUSTOM = 1;
+
+export const RETENTION_CUSTOM_INPUT = 'custom_retention_input';
+
+export const CUSTOM_INTERVAL = 'customInterval';
 
 export const FILTERS_INTERVALS_HOURS = [0, 1, 12, 24, 72, 168];
 
@@ -370,6 +236,14 @@ export const BLOCKING_MODES = {
     nxdomain: 'nxdomain',
     null_ip: 'null_ip',
     custom_ip: 'custom_ip',
+};
+
+// Note that translation strings contain these modes (theme_CONSTANT)
+// i.e. theme_auto, theme_light.
+export const THEMES = {
+    auto: 'auto',
+    dark: 'dark',
+    light: 'light',
 };
 
 export const WHOIS_ICONS = {
@@ -519,8 +393,8 @@ export const DEFAULT_DATE_FORMAT_OPTIONS = {
     month: 'numeric',
     day: 'numeric',
     hour: 'numeric',
+    hourCycle: 'h23',
     minute: 'numeric',
-    hour12: false,
 };
 
 export const DETAILED_DATE_FORMAT_OPTIONS = {
@@ -528,7 +402,14 @@ export const DETAILED_DATE_FORMAT_OPTIONS = {
     month: 'long',
 };
 
-export const CUSTOM_FILTERING_RULES_ID = 0;
+export const SPECIAL_FILTER_ID = {
+    CUSTOM_FILTERING_RULES: 0,
+    SYSTEM_HOSTS: -1,
+    BLOCKED_SERVICES: -2,
+    PARENTAL: -3,
+    SAFE_BROWSING: -4,
+    SAFE_SEARCH: -5,
+};
 
 export const BLOCK_ACTIONS = {
     BLOCK: 'block',
@@ -578,13 +459,18 @@ export const FORM_NAME = {
 };
 
 export const SMALL_SCREEN_SIZE = 767;
-export const MEDIUM_SCREEN_SIZE = 1023;
+export const MEDIUM_SCREEN_SIZE = 1024;
 
 export const SECONDS_IN_DAY = 60 * 60 * 24;
 
 export const UINT32_RANGE = {
     MIN: 0,
     MAX: 4294967295,
+};
+
+export const RETENTION_RANGE = {
+    MIN: 1,
+    MAX: 365 * 24,
 };
 
 export const DHCP_VALUES_PLACEHOLDERS = {
@@ -623,6 +509,8 @@ export const TOAST_TYPES = {
 };
 
 export const SUCCESS_TOAST_TIMEOUT = 5000;
+
+export const ONE_SECOND_IN_MS = 1000;
 export const FAILURE_TOAST_TIMEOUT = 30000;
 
 export const TOAST_TIMEOUTS = {
@@ -651,3 +539,14 @@ export const MOBILE_CONFIG_LINKS = {
     DOT: 'apple/dot.mobileconfig',
     DOH: 'apple/doh.mobileconfig',
 };
+
+// Timings for disable protection in milliseconds
+export const DISABLE_PROTECTION_TIMINGS = {
+    HALF_MINUTE: 30 * 1000,
+    MINUTE: 60 * 1000,
+    TEN_MINUTES: 10 * 60 * 1000,
+    HOUR: 60 * 60 * 1000,
+    TOMORROW: 24 * 60 * 60 * 1000,
+};
+
+export const LOCAL_STORAGE_THEME_KEY = 'account_theme';

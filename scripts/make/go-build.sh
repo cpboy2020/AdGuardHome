@@ -6,6 +6,11 @@
 # only has superficial knowledge of the POSIX shell language and alike.
 # Experienced readers may find it overly verbose.
 
+# This comment is used to simplify checking local copies of the script.  Bump
+# this number every time a significant change is made to this script.
+#
+# AdGuard-Project-Version: 1
+
 # The default verbosity level is 0.  Show every command that is run and every
 # package that is processed if the caller requested verbosity level greater than
 # 0.  Also show subcommands if the requested verbosity level is greater than 1.
@@ -65,9 +70,9 @@ then
 fi
 readonly version
 
-# Set date and time of the current build unless already set.
-buildtime="${BUILD_TIME:-$( date -u +%FT%TZ%z )}"
-readonly buildtime
+# Set date and time of the latest commit unless already set.
+committime="${SOURCE_DATE_EPOCH:-$( git log -1 --pretty=%ct )}"
+readonly committime
 
 # Set the linker flags accordingly: set the release channel and the current
 # version as well as goarm and gomips variable values, if the variables are set
@@ -78,7 +83,7 @@ readonly version_pkg
 ldflags="-s -w"
 ldflags="${ldflags} -X ${version_pkg}.version=${version}"
 ldflags="${ldflags} -X ${version_pkg}.channel=${channel}"
-ldflags="${ldflags} -X ${version_pkg}.buildtime=${buildtime}"
+ldflags="${ldflags} -X ${version_pkg}.committime=${committime}"
 if [ "${GOARM:-}" != '' ]
 then
 	ldflags="${ldflags} -X ${version_pkg}.goarm=${GOARM}"
@@ -111,16 +116,37 @@ readonly o_flags
 # must be enabled.
 if [ "${RACE:-0}" -eq '0' ]
 then
-	cgo_enabled='0'
+	CGO_ENABLED='0'
 	race_flags='--race=0'
 else
-	cgo_enabled='1'
+	CGO_ENABLED='1'
 	race_flags='--race=1'
 fi
-readonly cgo_enabled race_flags
+readonly CGO_ENABLED race_flags
+export CGO_ENABLED
 
-CGO_ENABLED="$cgo_enabled"
 GO111MODULE='on'
-export CGO_ENABLED GO111MODULE
+export GO111MODULE
 
-"$go" build --ldflags "$ldflags" "$race_flags" --trimpath "$o_flags" "$v_flags" "$x_flags"
+# Build the new binary if requested.
+if [ "${NEXTAPI:-0}" -eq '0' ]
+then
+	tags_flags='--tags='
+else
+	tags_flags='--tags=next'
+fi
+readonly tags_flags
+
+if [ "$verbose" -gt '0' ]
+then
+	"$go" env
+fi
+
+"$go" build\
+	--ldflags "$ldflags"\
+	"$race_flags"\
+	"$tags_flags"\
+	--trimpath\
+	"$o_flags"\
+	"$v_flags"\
+	"$x_flags"

@@ -1,15 +1,17 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import classNames from 'classnames';
+import { useDispatch, useSelector } from 'react-redux';
+import cn from 'classnames';
 
-import { REPOSITORY, PRIVACY_POLICY_LINK } from '../../helpers/constants';
+import { REPOSITORY, PRIVACY_POLICY_LINK, THEMES } from '../../helpers/constants';
 import { LANGUAGES } from '../../helpers/twosky';
 import i18n from '../../i18n';
 
 import Version from './Version';
 import './Footer.css';
 import './Select.css';
-import { setHtmlLangAttr } from '../../helpers/helpers';
+import { setHtmlLangAttr, setUITheme } from '../../helpers/helpers';
+import { changeTheme } from '../../actions';
 
 const linksData = [
     {
@@ -29,6 +31,16 @@ const linksData = [
 
 const Footer = () => {
     const { t } = useTranslation();
+    const dispatch = useDispatch();
+
+    const currentTheme = useSelector((state) => (
+        state.dashboard ? state.dashboard.theme : THEMES.auto
+    ));
+    const profileName = useSelector((state) => (
+        state.dashboard ? state.dashboard.name : ''
+    ));
+    const isLoggedIn = profileName !== '';
+    const [currentThemeLocal, setCurrentThemeLocal] = useState(THEMES.auto);
 
     const getYear = () => {
         const today = new Date();
@@ -41,22 +53,72 @@ const Footer = () => {
         setHtmlLangAttr(value);
     };
 
+    const onThemeChange = (value) => {
+        if (isLoggedIn) {
+            dispatch(changeTheme(value));
+        } else {
+            setUITheme(value);
+            setCurrentThemeLocal(value);
+        }
+    };
+
     const renderCopyright = () => <div className="footer__column">
         <div className="footer__copyright">
             {t('copyright')} &copy; {getYear()}{' '}
-            <a target="_blank" rel="noopener noreferrer" href="https://adguard.com/">AdGuard</a>
+            <a target="_blank" rel="noopener noreferrer" href="https://link.adtidy.org/forward.html?action=home&from=ui&app=home">AdGuard</a>
         </div>
     </div>;
 
     const renderLinks = (linksData) => linksData.map(({ name, href, className = '' }) => <a
             key={name}
             href={href}
-            className={classNames('footer__link', className)}
+            className={cn('footer__link', className)}
             target="_blank"
             rel="noopener noreferrer"
         >
             {t(name)}
         </a>);
+
+    const renderThemeButtons = () => {
+        const currentValue = isLoggedIn ? currentTheme : currentThemeLocal;
+
+        const content = {
+            auto: {
+                desc: t('theme_auto_desc'),
+                icon: '#auto',
+            },
+            dark: {
+                desc: t('theme_dark_desc'),
+                icon: '#dark',
+            },
+            light: {
+                desc: t('theme_light_desc'),
+                icon: '#light',
+            },
+        };
+
+        return (
+            Object.values(THEMES)
+                .map((theme) => (
+                    <button
+                        key={theme}
+                        type="button"
+                        className="btn btn-sm btn-secondary footer__theme-button"
+                        onClick={() => onThemeChange(theme)}
+                        title={content[theme].desc}
+                    >
+                        <svg
+                            className={cn(
+                                'footer__theme-icon',
+                                { 'footer__theme-icon--active': currentValue === theme },
+                            )}
+                        >
+                            <use xlinkHref={content[theme].icon} />
+                        </svg>
+                    </button>
+                ))
+        );
+    };
 
     return (
         <>
@@ -65,6 +127,13 @@ const Footer = () => {
                     <div className="footer__row">
                         <div className="footer__column footer__column--links">
                             {renderLinks(linksData)}
+                        </div>
+                        <div className="footer__column footer__column--theme">
+                            <div className="footer__themes">
+                                <div className="btn-group">
+                                    {renderThemeButtons()}
+                                </div>
+                            </div>
                         </div>
                         <div className="footer__column footer__column--language">
                             <select

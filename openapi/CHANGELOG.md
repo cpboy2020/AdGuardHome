@@ -2,7 +2,397 @@
 
 <!-- TODO(a.garipov): Reformat in accordance with the KeepAChangelog spec. -->
 
-## v0.107: API changes
+## v0.108.0: API changes
+
+## v0.107.30: API changes
+
+### `POST /control/version.json` and `GET /control/dhcp/interfaces` content type
+
+* The value of the `Content-Type` header in the `POST /control/version.json` and
+  `GET /control/dhcp/interfaces` HTTP APIs is now correctly set to
+  `application/json` as opposed to `text/plain`.
+
+
+
+## v0.107.29: API changes
+
+### `GET /control/clients` And `GET /control/clients/find`
+* The new optional fields `"ignore_querylog"` and `"ignore_statistics"` are set
+  if AdGuard Home excludes client activity from query log or statistics.
+
+### `POST /control/clients/add` And `POST /control/clients/update`
+* The new optional fields `"ignore_querylog"` and `"ignore_statistics"` make
+  AdGuard Home exclude client activity from query log or statistics.  If not
+  set AdGuard Home will use default value (false).  It can be changed in the
+  future versions.
+
+
+
+## v0.107.27: API changes
+
+### The new optional fields `"edns_cs_use_custom"` and `"edns_cs_custom_ip"` in `DNSConfig`
+
+* The new optional fields `"edns_cs_use_custom"` and `"edns_cs_custom_ip"` in
+  `POST /control/dns_config` method makes AdGuard Home use or not use the
+  custom IP for EDNS Client Subnet.
+
+* The new optional fields `"edns_cs_use_custom"` and `"edns_cs_custom_ip"` in
+  `GET /control/dns_info` method are set if AdGuard Home uses custom IP for
+  EDNS Client Subnet.
+
+### Deprecated statistics APIs
+
+* The `GET /control/stats_info` HTTP API; use the new `GET
+  /control/stats/config` API instead.
+
+  **NOTE:** If `interval` was configured by editing configuration file or new
+  HTTP API call `PUT /control/stats/config/update` and it's not equal to
+  previous allowed enum values then it will be equal to `90` days for
+  compatibility reasons.
+
+* The `POST /control/stats_config` HTTP API; use the new `PUT
+  /control/stats/config/update` API instead.
+
+### New statistics APIs
+
+* The new `GET /control/stats/config` HTTP API.
+
+* The new `PUT /control/stats/config/update` HTTP API allows config updates.
+
+These `control/stats/config/update` and `control/stats/config` APIs accept and
+return a JSON object with the following format:
+
+```json
+{
+  "enabled": true,
+  "interval": 3600,
+  "ignored": ["example.com"],
+}
+```
+
+### Deprecated query log APIs
+
+* The `GET /control/querylog_info` HTTP API; use the new `GET
+  /control/querylog/config` API instead.
+
+  **NOTE:** If `interval` was configured by editing configuration file or new
+  HTTP API call `PUT /control/querylog/config/update` and it's not equal to
+  previous allowed enum values then it will be equal to `90` days for
+  compatibility reasons.
+
+* The `POST /control/querylog_config` HTTP API; use the new `PUT
+  /control/querylog/config/update` API instead.
+
+### New query log APIs
+
+* The new `GET /control/querylog/config` HTTP API.
+
+* The new `PUT /control/querylog/config/update` HTTP API allows config updates.
+
+These `control/querylog/config/update` and `control/querylog/config` APIs
+accept and return a JSON object with the following format:
+
+```json
+{
+  "enabled": true,
+  "anonymize_client_ip": false,
+  "interval": 3600,
+  "ignored": ["example.com"],
+}
+```
+
+### New `"protection_disabled_until"` field in `GET /control/dns_info` response
+
+* The new field `"protection_disabled_until"` in `GET /control/dns_info` is the
+  timestamp until when the protection is disabled.
+
+### New `"protection_disabled_duration"` field in `GET /control/status` response
+
+* The new field `"protection_disabled_duration"` is the duration of protection
+  pause in milliseconds.
+
+### `POST /control/protection`
+
+* The new `POST /control/protection` HTTP API allows to pause protection for
+  specified duration in milliseconds.
+
+This API accepts a JSON object with the following format:
+
+```json
+{
+  "enabled": false,
+  "duration": 10000
+}
+```
+
+### Deprecated HTTP APIs
+
+The following HTTP APIs are deprecated:
+
+* `POST /control/safesearch/enable` is deprecated.  Use the new
+  `PUT /control/safesearch/settings`.
+
+* `POST /control/safesearch/disable` is deprecated.  Use the new
+  `PUT /control/safesearch/settings`.
+
+### New HTTP API `PUT /control/safesearch/settings`
+
+* The new `PUT /control/safesearch/settings` HTTP API allows safesearch
+  settings updates. It accepts a JSON object with the following format:
+
+```json
+{
+  "enabled": true,
+  "bing": false,
+  "duckduckgo": true,
+  "google": false,
+  "pixabay": false,
+  "yandex": true,
+  "youtube": false
+}
+```
+
+### `GET /control/safesearch/status`
+
+* The `control/safesearch/status` HTTP API has been changed.  It now returns a
+  JSON object with the following format:
+
+```json
+{
+  "enabled": true,
+  "bing": false,
+  "duckduckgo": true,
+  "google": false,
+  "pixabay": false,
+  "yandex": true,
+  "youtube": false
+}
+```
+
+### `/control/clients` HTTP APIs
+
+The following HTTP APIs have been changed:
+
+*  `GET /control/clients`;
+*  `GET /control/clients/find?ip0=...&ip1=...&ip2=...`;
+*  `POST /control/clients/add`;
+*  `POST /control/clients/update`;
+
+The `safesearch_enabled` field is deprecated.  The new field `safe_search` has
+been added to JSON objects.  It has the following format:
+
+```json
+{
+  "enabled": true,
+  "bing": false,
+  "duckduckgo": true,
+  "google": false,
+  "pixabay": false,
+  "yandex": true,
+  "youtube": false
+}
+```
+
+
+
+## v0.107.23: API changes
+
+### Experimental “beta” APIs removed
+
+The following experimental beta APIs have been removed:
+
+ *  `GET  /control/install/get_addresses_beta`;
+ *  `POST /control/install/check_config_beta`;
+ *  `POST /control/install/configure_beta`.
+
+They never quite worked properly, and the future new version of AdGuard Home API
+will probably be different.
+
+
+
+## v0.107.22: API changes
+
+### `POST /control/i18n/change_language` is deprecated
+
+Use `PUT /control/profile/update`.
+
+### `GET /control/i18n/current_language` is deprecated
+
+Use `GET /control/profile`.
+
+* The `/control/profile` HTTP API has been changed.
+
+* The new `PUT /control/profile/update` HTTP API allows user info updates.
+
+These `control/profile/update` and `control/profile` APIs accept and return a
+JSON object with the following format:
+
+```json
+{
+  "name":"user name", 
+  "language": "en",
+  "theme": "auto"
+}
+```
+
+
+
+## v0.107.20: API Changes
+
+### `POST /control/cache_clear`
+
+* The new `POST /control/cache_clear` HTTP API allows clearing the DNS cache.
+
+
+
+## v0.107.17: API Changes
+
+### `GET /control/blocked_services/services` is deprecated
+
+Use `GET /control/blocked_services/all`.
+
+### `GET /control/blocked_services/all`
+
+* The new `GET /control/blocked_services/all` HTTP API allows inspecting all
+  available services and their data, such as SVG icons and human-readable names.
+
+
+
+## v0.107.15: `POST` Requests Without Bodies
+
+As an additional CSRF protection measure, AdGuard Home now ensures that requests
+that change its state but have no body do not have a `Content-Type` header set
+on them.
+
+This concerns the following APIs:
+
+* `POST /control/dhcp/reset_leases`;
+* `POST /control/dhcp/reset`;
+* `POST /control/parental/disable`;
+* `POST /control/parental/enable`;
+* `POST /control/querylog_clear`;
+* `POST /control/safebrowsing/disable`;
+* `POST /control/safebrowsing/enable`;
+* `POST /control/safesearch/disable`;
+* `POST /control/safesearch/enable`;
+* `POST /control/stats_reset`;
+* `POST /control/update`.
+
+
+
+## v0.107.14: BREAKING API CHANGES
+
+A Cross-Site Request Forgery (CSRF) vulnerability has been discovered.  We have
+implemented several measures to prevent such vulnerabilities in the future, but
+some of these measures break backwards compatibility for the sake of better
+protection.
+
+All JSON APIs that expect a body now check if the request actually has
+`Content-Type` set to `application/json`.
+
+All new formats for the request and response bodies are documented in
+`openapi.yaml`.
+
+### `POST /control/filtering/set_rules` And Other Plain-Text APIs
+
+The following APIs, which previously accepted or returned `text/plain` data,
+now accept or return data as JSON.
+
+#### `POST /control/filtering/set_rules`
+
+Previously, the API accepted a raw list of filters as a plain-text file.  Now,
+the filters must be presented in a JSON object with the following format:
+
+```json
+{
+  "rules":
+  [
+    "||example.com^",
+    "# comment",
+    "@@||www.example.com^"
+  ]
+}
+```
+
+#### `GET /control/i18n/current_language` And `POST /control/i18n/change_language`
+
+Previously, these APIs accepted and returned the language code in plain text.
+Now, they accept and return them in a JSON object with the following format:
+
+```json
+{
+  "language": "en"
+}
+```
+
+#### `POST /control/dhcp/find_active_dhcp`
+
+Previously, the API accepted the name of the network interface as a plain-text
+string.  Now, it must be contained within a JSON object with the following
+format:
+
+```json
+{
+  "interface": "eth0"
+}
+```
+
+
+
+## v0.107.12: API changes
+
+### `GET /control/blocked_services/services`
+
+* The new `GET /control/blocked_services/services` HTTP API allows inspecting
+  all available services.
+
+
+
+## v0.107.7: API changes
+
+### The new optional field `"ecs"` in `QueryLogItem`
+
+* The new optional field `"ecs"` in `GET /control/querylog` contains the IP
+  network from an EDNS Client-Subnet option from the request message if any.
+
+### The new possible status code in `/install/configure` response.
+
+* The new status code `422 Unprocessable Entity` in the response for
+  `POST /install/configure` which means that the specified password does not
+  meet the strength requirements.
+
+
+
+## v0.107.3: API changes
+
+### The new field `"version"` in `AddressesInfo`
+
+* The new field `"version"` in `GET /install/get_addresses` is the version of
+  the AdGuard Home instance.
+
+
+
+## v0.107.0: API changes
+
+### The new field `"cached"` in `QueryLogItem`
+
+* The new field `"cached"` in `GET /control/querylog` is true if the response is
+  served from cache instead of being resolved by an upstream server.
+
+### New constant values for `filter_list_id` field in `ResultRule`
+
+* Value of `0` is now used for custom filtering rules list.
+
+* Value of `-1` is now used for rules generated from the operating system hosts
+  files.
+
+* Value of `-2` is now used for blocked services' rules.
+
+* Value of `-3` is now used for rules generated by parental control web service.
+
+* Value of `-4` is now used for rules generated by safe browsing web service.
+
+* Value of `-5` is now used for rules generated by safe search web service.
 
 ### New possible value of `"name"` field in `QueryLogItemClient`
 
@@ -42,9 +432,9 @@
 
 * The type of `"interval"` field is now `number` instead of `integer`.
 
-### Client IDs in Access Settings
+### ClientIDs in Access Settings
 
-* The `POST /control/access/set` HTTP API now accepts client IDs in
+* The `POST /control/access/set` HTTP API now accepts ClientIDs in
   `"allowed_clients"` and `"disallowed_clients"` fields.
 
 ### The new field `"unicode_name"` in `DNSQuestion`

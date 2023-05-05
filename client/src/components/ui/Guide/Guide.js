@@ -7,7 +7,6 @@ import { useSelector } from 'react-redux';
 import { MOBILE_CONFIG_LINKS } from '../../../helpers/constants';
 
 import Tabs from '../Tabs';
-import Icons from '../Icons';
 import MobileConfigForm from './MobileConfigForm';
 
 const renderLi = ({ label, components }) => <li key={label}>
@@ -38,7 +37,7 @@ const getDnsPrivacyList = () => [
                 components: [
                     {
                         key: 0,
-                        href: 'https://adguard.com/adguard-android/overview.html',
+                        href: 'https://link.adtidy.org/forward.html?action=android&from=ui&app=home',
                     },
                     <code key="1">text</code>,
                 ],
@@ -63,7 +62,7 @@ const getDnsPrivacyList = () => [
                 components: [
                     {
                         key: 0,
-                        href: 'https://adguard.com/adguard-ios/overview.html',
+                        href: 'https://link.adtidy.org/forward.html?action=ios&from=ui&app=home',
                     },
                     <code key="1">text</code>,
                 ],
@@ -341,7 +340,6 @@ const Guide = ({ dnsAddresses }) => {
             >
                 {activeTab}
             </Tabs>
-            <Icons />
         </div>
     );
 };

@@ -2,8 +2,11 @@
   {
     "project_id": "home",
     "base_locale": "en",
-    "localizable_files": ["client/src/__locales/en.json"],
+    "localizable_files": [
+      "client/src/__locales/en.json"
+    ],
     "languages": {
+      "ar": "العربية",
       "be": "Беларуская",
       "bg": "Български",
       "cs": "Český",
@@ -12,6 +15,7 @@
       "en": "English",
       "es": "Español",
       "fa": "فارسی",
+      "fi": "Suomi",
       "fr": "Français",
       "hr": "Hrvatski",
       "hu": "Magyar",
@@ -33,6 +37,7 @@
       "sv": "Svenska",
       "th": "ภาษาไทย",
       "tr": "Türkçe",
+      "uk": "Українська",
       "vi": "Tiếng Việt",
       "zh-cn": "简体中文",
       "zh-hk": "繁體中文（香港）",

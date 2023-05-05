@@ -1,6 +1,7 @@
 package querylog
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
@@ -85,7 +86,7 @@ func ctDomainOrClientCaseNonStrict(
 
 // quickMatch quickly checks if the line matches the given search criterion.
 // It returns false if the like doesn't match.  This method is only here for
-// optimisation purposes.
+// optimization purposes.
 func (c *searchCriterion) quickMatch(line string, findClient quickMatchClientFunc) (ok bool) {
 	switch c.criterionType {
 	case ctTerm:
@@ -99,24 +100,10 @@ func (c *searchCriterion) quickMatch(line string, findClient quickMatchClientFun
 		}
 
 		if c.strict {
-			return ctDomainOrClientCaseStrict(
-				c.value,
-				c.asciiVal,
-				clientID,
-				name,
-				host,
-				ip,
-			)
+			return ctDomainOrClientCaseStrict(c.value, c.asciiVal, clientID, name, host, ip)
 		}
 
-		return ctDomainOrClientCaseNonStrict(
-			c.value,
-			c.asciiVal,
-			clientID,
-			name,
-			host,
-			ip,
-		)
+		return ctDomainOrClientCaseNonStrict(c.value, c.asciiVal, clientID, name, host, ip)
 	case ctFilteringStatus:
 		// Go on, as we currently don't do quick matches against
 		// filtering statuses.
@@ -132,7 +119,7 @@ func (c *searchCriterion) match(entry *logEntry) bool {
 	case ctTerm:
 		return c.ctDomainOrClientCase(entry)
 	case ctFilteringStatus:
-		return c.ctFilteringStatusCase(entry.Result)
+		return c.ctFilteringStatusCase(entry.Result.Reason, entry.Result.IsFiltered)
 	}
 
 	return false
@@ -155,54 +142,68 @@ func (c *searchCriterion) ctDomainOrClientCase(e *logEntry) bool {
 	return ctDomainOrClientCaseNonStrict(c.value, c.asciiVal, clientID, name, host, ip)
 }
 
-func (c *searchCriterion) ctFilteringStatusCase(res filtering.Result) bool {
+// ctFilteringStatusCase returns true if the result matches the value.
+func (c *searchCriterion) ctFilteringStatusCase(
+	reason filtering.Reason,
+	isFiltered bool,
+) (matched bool) {
 	switch c.value {
 	case filteringStatusAll:
 		return true
-
 	case filteringStatusFiltered:
-		return res.IsFiltered ||
-			res.Reason.In(
-				filtering.NotFilteredAllowList,
-				filtering.Rewritten,
-				filtering.RewrittenAutoHosts,
-				filtering.RewrittenRule,
-			)
-
-	case filteringStatusBlocked:
-		return res.IsFiltered &&
-			res.Reason.In(filtering.FilteredBlockList, filtering.FilteredBlockedService)
-
-	case filteringStatusBlockedService:
-		return res.IsFiltered && res.Reason == filtering.FilteredBlockedService
-
-	case filteringStatusBlockedParental:
-		return res.IsFiltered && res.Reason == filtering.FilteredParental
-
-	case filteringStatusBlockedSafebrowsing:
-		return res.IsFiltered && res.Reason == filtering.FilteredSafeBrowsing
-
-	case filteringStatusWhitelisted:
-		return res.Reason == filtering.NotFilteredAllowList
-
-	case filteringStatusRewritten:
-		return res.Reason.In(
+		return isFiltered || reason.In(
+			filtering.NotFilteredAllowList,
 			filtering.Rewritten,
 			filtering.RewrittenAutoHosts,
 			filtering.RewrittenRule,
 		)
-
-	case filteringStatusSafeSearch:
-		return res.IsFiltered && res.Reason == filtering.FilteredSafeSearch
-
+	case
+		filteringStatusBlocked,
+		filteringStatusBlockedParental,
+		filteringStatusBlockedSafebrowsing,
+		filteringStatusBlockedService,
+		filteringStatusSafeSearch:
+		return isFiltered && c.isFilteredWithReason(reason)
+	case filteringStatusWhitelisted:
+		return reason == filtering.NotFilteredAllowList
+	case filteringStatusRewritten:
+		return reason.In(
+			filtering.Rewritten,
+			filtering.RewrittenAutoHosts,
+			filtering.RewrittenRule,
+		)
 	case filteringStatusProcessed:
-		return !res.Reason.In(
+		return !reason.In(
 			filtering.FilteredBlockList,
 			filtering.FilteredBlockedService,
 			filtering.NotFilteredAllowList,
 		)
-
 	default:
 		return false
+	}
+}
+
+// isFilteredWithReason returns true if reason matches the criterion value.
+// c.value must be one of:
+//
+//   - filteringStatusBlocked
+//   - filteringStatusBlockedParental
+//   - filteringStatusBlockedSafebrowsing
+//   - filteringStatusBlockedService
+//   - filteringStatusSafeSearch
+func (c *searchCriterion) isFilteredWithReason(reason filtering.Reason) (matched bool) {
+	switch c.value {
+	case filteringStatusBlocked:
+		return reason.In(filtering.FilteredBlockList, filtering.FilteredBlockedService)
+	case filteringStatusBlockedParental:
+		return reason == filtering.FilteredParental
+	case filteringStatusBlockedSafebrowsing:
+		return reason == filtering.FilteredSafeBrowsing
+	case filteringStatusBlockedService:
+		return reason == filtering.FilteredBlockedService
+	case filteringStatusSafeSearch:
+		return reason == filtering.FilteredSafeSearch
+	default:
+		panic(fmt.Errorf("unexpected value %q", c.value))
 	}
 }

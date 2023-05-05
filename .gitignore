@@ -12,7 +12,6 @@
 /agh-backup/
 /bin/
 /build/*
-/build2/*
 /data/
 /dist/
 /filtering/tests/filtering.TestLotsOfRules*.pprof
@@ -22,8 +21,6 @@
 /snapcraft_login
 AdGuardHome*
 coverage.txt
-leases.db
 node_modules/
 
 !/build/gitkeep
-!/build2/gitkeep
