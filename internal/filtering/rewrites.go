@@ -1,23 +1,27 @@
 package filtering
 
 import (
+	"context"
 	"fmt"
-	"net"
+	"log/slog"
+	"net/netip"
+	"slices"
 	"strings"
 
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/mathutil"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/miekg/dns"
-	"golang.org/x/exp/slices"
 )
 
 // Legacy DNS rewrites
 
 // LegacyRewrite is a single legacy DNS rewrite record.
 //
-// Instances of *LegacyRewrite must never be nil.
+// Instances of *LegacyRewrite must not be nil.
+//
+// NOTE:  Keep fields in sync with [cloneRewrites].
 type LegacyRewrite struct {
-	// Domain is the domain pattern for which this rewrite should work.
+	// Domain is the pattern to which this rewrite applies.
 	Domain string `yaml:"domain"`
 
 	// Answer is the IP address, canonical name, or one of the special
@@ -26,20 +30,13 @@ type LegacyRewrite struct {
 
 	// IP is the IP address that should be used in the response if Type is
 	// dns.TypeA or dns.TypeAAAA.
-	IP net.IP `yaml:"-"`
+	IP netip.Addr `yaml:"-"`
 
 	// Type is the DNS record type: A, AAAA, or CNAME.
 	Type uint16 `yaml:"-"`
-}
 
-// clone returns a deep clone of rw.
-func (rw *LegacyRewrite) clone() (cloneRW *LegacyRewrite) {
-	return &LegacyRewrite{
-		Domain: rw.Domain,
-		Answer: rw.Answer,
-		IP:     slices.Clone(rw.IP),
-		Type:   rw.Type,
-	}
+	// Enabled indicates whether this rewrite is active.
+	Enabled bool `yaml:"enabled"`
 }
 
 // equal returns true if the rw is equal to the other.
@@ -61,14 +58,14 @@ func (rw *LegacyRewrite) matchesQType(qt uint16) (ok bool) {
 
 	// If the types match or the entry is set to allow only the other type,
 	// include them.
-	return rw.Type == qt || rw.IP == nil
+	return rw.Type == qt || rw.IP == netip.Addr{}
 }
 
-// normalize makes sure that the a new or decoded entry is normalized with
-// regards to domain name case, IP length, and so on.
+// normalize makes sure that the new or decoded entry is normalized with regards
+// to domain name case, IP length, and so on.
 //
 // If rw is nil, it returns an errors.
-func (rw *LegacyRewrite) normalize() (err error) {
+func (rw *LegacyRewrite) normalize(ctx context.Context, l *slog.Logger) (err error) {
 	if rw == nil {
 		return errors.Error("nil rewrite entry")
 	}
@@ -80,12 +77,12 @@ func (rw *LegacyRewrite) normalize() (err error) {
 
 	switch rw.Answer {
 	case "AAAA":
-		rw.IP = nil
+		rw.IP = netip.Addr{}
 		rw.Type = dns.TypeAAAA
 
 		return nil
 	case "A":
-		rw.IP = nil
+		rw.IP = netip.Addr{}
 		rw.Type = dns.TypeA
 
 		return nil
@@ -93,19 +90,18 @@ func (rw *LegacyRewrite) normalize() (err error) {
 		// Go on.
 	}
 
-	ip := net.ParseIP(rw.Answer)
-	if ip == nil {
+	ip, err := netip.ParseAddr(rw.Answer)
+	if err != nil {
+		l.DebugContext(ctx, "normalizing legacy rewrite", slogutil.KeyError, err)
 		rw.Type = dns.TypeCNAME
 
 		return nil
 	}
 
-	ip4 := ip.To4()
-	if ip4 != nil {
-		rw.IP = ip4
+	rw.IP = ip
+	if ip.Is4() {
 		rw.Type = dns.TypeA
 	} else {
-		rw.IP = ip
 		rw.Type = dns.TypeAAAA
 	}
 
@@ -122,30 +118,34 @@ func matchDomainWildcard(host, wildcard string) (ok bool) {
 	return isWildcard(wildcard) && strings.HasSuffix(host, wildcard[1:])
 }
 
-// legacyRewriteSortsBefore sorts rewirtes according to the following priority:
+// Compare is used to sort rewrites according to the following priority:
 //
 //  1. A and AAAA > CNAME;
 //  2. wildcard > exact;
 //  3. lower level wildcard > higher level wildcard;
-func legacyRewriteSortsBefore(a, b *LegacyRewrite) (sortsBefore bool) {
-	if a.Type == dns.TypeCNAME && b.Type != dns.TypeCNAME {
-		return true
-	} else if a.Type != dns.TypeCNAME && b.Type == dns.TypeCNAME {
-		return false
+func (rw *LegacyRewrite) Compare(b *LegacyRewrite) (res int) {
+	if rw.Type == dns.TypeCNAME {
+		if b.Type != dns.TypeCNAME {
+			return -1
+		}
+	} else if b.Type == dns.TypeCNAME {
+		return 1
 	}
 
-	if aIsWld, bIsWld := isWildcard(a.Domain), isWildcard(b.Domain); aIsWld != bIsWld {
-		return bIsWld
+	if aIsWld, bIsWld := isWildcard(rw.Domain), isWildcard(b.Domain); aIsWld == bIsWld {
+		// Both are either wildcards or both aren't.
+		return len(b.Domain) - len(rw.Domain)
+	} else if aIsWld {
+		return 1
+	} else {
+		return -1
 	}
-
-	// Both are either wildcards or both aren't.
-	return len(a.Domain) > len(b.Domain)
 }
 
 // prepareRewrites normalizes and validates all legacy DNS rewrites.
-func (d *DNSFilter) prepareRewrites() (err error) {
-	for i, r := range d.Rewrites {
-		err = r.normalize()
+func (d *DNSFilter) prepareRewrites(ctx context.Context) (err error) {
+	for i, r := range d.conf.Rewrites {
+		err = r.normalize(ctx, d.logger)
 		if err != nil {
 			return fmt.Errorf("at index %d: %w", i, err)
 		}
@@ -167,6 +167,10 @@ func findRewrites(
 	qtype uint16,
 ) (rewrites []*LegacyRewrite, matched bool) {
 	for _, e := range entries {
+		if !e.Enabled {
+			continue
+		}
+
 		if e.Domain != host && !matchDomainWildcard(host, e.Domain) {
 			continue
 		}
@@ -181,17 +185,63 @@ func findRewrites(
 		return nil, matched
 	}
 
-	slices.SortFunc(rewrites, legacyRewriteSortsBefore)
+	return finalizeRewrites(rewrites), matched
+}
+
+// finalizeRewrites sorts rewrites and truncates wildcard ones.
+func finalizeRewrites(rewrites []*LegacyRewrite) (resRewrites []*LegacyRewrite) {
+	slices.SortFunc(rewrites, (*LegacyRewrite).Compare)
 
 	for i, r := range rewrites {
 		if isWildcard(r.Domain) {
 			// Don't use rewrites[:0], because we need to return at least one
 			// item here.
-			rewrites = rewrites[:mathutil.Max(1, i)]
+			rewrites = rewrites[:max(1, i)]
 
 			break
 		}
 	}
 
-	return rewrites, matched
+	return rewrites
+}
+
+// setRewriteResult sets the Reason or IPList of res if necessary.  res must not
+// be nil.
+func (d *DNSFilter) setRewriteResult(
+	ctx context.Context,
+	res *Result,
+	host string,
+	rewrites []*LegacyRewrite,
+	qtype uint16,
+) {
+	for _, rw := range rewrites {
+		if rw.Type == qtype && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
+			if rw.IP == (netip.Addr{}) {
+				// "A"/"AAAA" exception: allow getting from upstream.
+				res.Reason = NotFilteredNotFound
+
+				return
+			}
+
+			res.IPList = append(res.IPList, rw.IP)
+
+			d.logger.DebugContext(ctx, "set a/aaaa rewrite", "host", host, "ans", rw.IP)
+		}
+	}
+}
+
+// cloneRewrites returns a deep copy of entries.
+func cloneRewrites(entries []*LegacyRewrite) (clone []*LegacyRewrite) {
+	clone = make([]*LegacyRewrite, len(entries))
+	for i, rw := range entries {
+		clone[i] = &LegacyRewrite{
+			Domain:  rw.Domain,
+			Answer:  rw.Answer,
+			IP:      rw.IP,
+			Type:    rw.Type,
+			Enabled: rw.Enabled,
+		}
+	}
+
+	return clone
 }

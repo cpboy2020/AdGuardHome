@@ -1,10 +1,9 @@
 package hashprefix
 
 import (
+	"context"
 	"encoding/binary"
 	"time"
-
-	"github.com/AdguardTeam/golibs/log"
 )
 
 // expirySize is the size of expiry in cacheItem.
@@ -22,10 +21,12 @@ type cacheItem struct {
 // toCacheItem decodes cacheItem from data.  data must be at least equal to
 // expiry size.
 func toCacheItem(data []byte) *cacheItem {
+	// #nosec G115 -- Assume that the values are as the ones that have been
+	// encoded.
 	t := time.Unix(int64(binary.BigEndian.Uint64(data)), 0)
 
 	data = data[expirySize:]
-	hashes := make([]hostnameHash, len(data)/hashSize)
+	hashes := make([]hostnameHash, 0, len(data)/hashSize)
 
 	for i := 0; i < len(data); i += hashSize {
 		var hash hostnameHash
@@ -41,12 +42,13 @@ func toCacheItem(data []byte) *cacheItem {
 
 // fromCacheItem encodes cacheItem into data.
 func fromCacheItem(item *cacheItem) (data []byte) {
-	data = make([]byte, len(item.hashes)*hashSize+expirySize)
+	data = make([]byte, 0, len(item.hashes)*hashSize+expirySize)
+
 	expiry := item.expiry.Unix()
-	binary.BigEndian.PutUint64(data[:expirySize], uint64(expiry))
+	// #nosec G115 -- The Unix epoch time is highly unlikely to be negative.
+	data = binary.BigEndian.AppendUint64(data, uint64(expiry))
 
 	for _, v := range item.hashes {
-		// nolint:looppointer // The subsilce is used for a copy.
 		data = append(data, v[:]...)
 	}
 
@@ -62,7 +64,6 @@ func (c *Checker) findInCache(
 
 	i := 0
 	for _, hash := range hashes {
-		// nolint:looppointer // The subsilce is used for a safe cache lookup.
 		data := c.cache.Get(hash[:prefixLen])
 		if data == nil {
 			hashes[i] = hash
@@ -92,39 +93,38 @@ func (c *Checker) findInCache(
 }
 
 // storeInCache caches hashes.
-func (c *Checker) storeInCache(hashesToRequest, respHashes []hostnameHash) {
+func (c *Checker) storeInCache(ctx context.Context, hashesToRequest, respHashes []hostnameHash) {
 	hashToStore := make(map[prefix][]hostnameHash)
 
 	for _, hash := range respHashes {
 		var pref prefix
-		// nolint:looppointer // The subsilce is used for a copy.
 		copy(pref[:], hash[:])
 
 		hashToStore[pref] = append(hashToStore[pref], hash)
 	}
 
 	for pref, hash := range hashToStore {
-		// nolint:looppointer // The subsilce is used for a safe cache lookup.
-		c.setCache(pref[:], hash)
+		c.setCache(ctx, pref, hash)
 	}
 
 	for _, hash := range hashesToRequest {
-		// nolint:looppointer // The subsilce is used for a safe cache lookup.
-		pref := hash[:prefixLen]
-		val := c.cache.Get(pref)
+		val := c.cache.Get(hash[:prefixLen])
 		if val == nil {
-			c.setCache(pref, nil)
+			var pref prefix
+			copy(pref[:], hash[:])
+
+			c.setCache(ctx, pref, nil)
 		}
 	}
 }
 
 // setCache stores hash in cache.
-func (c *Checker) setCache(pref []byte, hashes []hostnameHash) {
+func (c *Checker) setCache(ctx context.Context, pref prefix, hashes []hostnameHash) {
 	item := &cacheItem{
 		expiry: time.Now().Add(c.cacheTime),
 		hashes: hashes,
 	}
 
-	c.cache.Set(pref, fromCacheItem(item))
-	log.Debug("%s: stored in cache: %v", c.svc, pref)
+	c.cache.Set(pref[:], fromCacheItem(item))
+	c.logger.DebugContext(ctx, "stored in cache", "pref", pref)
 }

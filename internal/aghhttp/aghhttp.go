@@ -2,20 +2,15 @@
 package aghhttp
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/version"
 	"github.com/AdguardTeam/golibs/httphdr"
-	"github.com/AdguardTeam/golibs/log"
-)
-
-// HTTP scheme constants.
-const (
-	SchemeHTTP  = "http"
-	SchemeHTTPS = "https"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 )
 
 // RegisterFunc is the function that sets the handler to handle the URL for the
@@ -24,17 +19,36 @@ const (
 // TODO(e.burkov, a.garipov):  Get rid of it.
 type RegisterFunc func(method, url string, handler http.HandlerFunc)
 
-// OK responds with word OK.
-func OK(w http.ResponseWriter) {
+// OK writes "OK\n" to the response.  l and w must not be nil.
+func OK(ctx context.Context, l *slog.Logger, w http.ResponseWriter) {
 	if _, err := io.WriteString(w, "OK\n"); err != nil {
-		log.Error("couldn't write body: %s", err)
+		l.WarnContext(ctx, "writing ok body", slogutil.KeyError, err)
 	}
 }
 
-// Error writes formatted message to w and also logs it.
-func Error(r *http.Request, w http.ResponseWriter, code int, format string, args ...any) {
+// ErrorAndLog writes a formatted HTTP error response and logs it at
+// [slog.LevelError] level.  l, r, and w must not be nil.
+func ErrorAndLog(
+	ctx context.Context,
+	l *slog.Logger,
+	r *http.Request,
+	w http.ResponseWriter,
+	code int,
+	format string,
+	args ...any,
+) {
 	text := fmt.Sprintf(format, args...)
-	log.Error("%s %s %s: %s", r.Method, r.Host, r.URL, text)
+	l.WarnContext(
+		ctx,
+		"http error",
+		"host", r.Host,
+		"method", r.Method,
+		"raddr", r.RemoteAddr,
+		"request_uri", r.RequestURI,
+		"status", code,
+		slogutil.KeyError, text,
+	)
+
 	http.Error(w, text, code)
 }
 
@@ -51,33 +65,18 @@ const textPlainDeprMsg = `using this api with the text/plain content-type is dep
 
 // WriteTextPlainDeprecated responds to the request with a message about
 // deprecation and removal of a plain-text API if the request is made with the
-// "text/plain" content-type.
-func WriteTextPlainDeprecated(w http.ResponseWriter, r *http.Request) (isPlainText bool) {
+// "text/plain" Content-Type.  All arguments must not be nil.
+func WriteTextPlainDeprecated(
+	ctx context.Context,
+	l *slog.Logger,
+	w http.ResponseWriter,
+	r *http.Request,
+) (isPlainText bool) {
 	if r.Header.Get(httphdr.ContentType) != HdrValTextPlain {
 		return false
 	}
 
-	Error(r, w, http.StatusUnsupportedMediaType, textPlainDeprMsg)
+	ErrorAndLog(ctx, l, r, w, http.StatusUnsupportedMediaType, textPlainDeprMsg)
 
 	return true
-}
-
-// WriteJSONResponse sets the content-type header in w.Header() to
-// "application/json", writes a header with a "200 OK" status, encodes resp to
-// w, calls [Error] on any returned error, and returns it as well.
-func WriteJSONResponse(w http.ResponseWriter, r *http.Request, resp any) (err error) {
-	return WriteJSONResponseCode(w, r, http.StatusOK, resp)
-}
-
-// WriteJSONResponseCode is like [WriteJSONResponse] but adds the ability to
-// redefine the status code.
-func WriteJSONResponseCode(w http.ResponseWriter, r *http.Request, code int, resp any) (err error) {
-	w.Header().Set(httphdr.ContentType, HdrValApplicationJSON)
-	w.WriteHeader(code)
-	err = json.NewEncoder(w).Encode(resp)
-	if err != nil {
-		Error(r, w, http.StatusInternalServerError, "encoding resp: %s", err)
-	}
-
-	return err
 }

@@ -1,13 +1,13 @@
 package dnsforward
 
 import (
+	"context"
 	"fmt"
-	"net"
+	"net/netip"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/urlfilter/rules"
 	"github.com/miekg/dns"
 )
@@ -15,6 +15,7 @@ import (
 // filterDNSRewriteResponse handles a single DNS rewrite response entry.  It
 // returns the properly constructed answer resource record.
 func (s *Server) filterDNSRewriteResponse(
+	ctx context.Context,
 	req *dns.Msg,
 	rr rules.RRType,
 	v rules.RRValue,
@@ -27,11 +28,11 @@ func (s *Server) filterDNSRewriteResponse(
 	case dns.TypeMX:
 		return s.ansFromDNSRewriteMX(v, rr, req)
 	case dns.TypeHTTPS, dns.TypeSVCB:
-		return s.ansFromDNSRewriteSVCB(v, rr, req)
+		return s.ansFromDNSRewriteSVCB(ctx, v, rr, req)
 	case dns.TypeSRV:
 		return s.ansFromDNSRewriteSRV(v, rr, req)
 	default:
-		log.Debug("don't know how to handle dns rr type %d, skipping", rr)
+		s.logger.DebugContext(ctx, "unsupported dns rr type, skipping", "res_record", rr)
 
 		return nil, nil
 	}
@@ -44,13 +45,13 @@ func (s *Server) ansFromDNSRewriteIP(
 	rr rules.RRType,
 	req *dns.Msg,
 ) (ans dns.RR, err error) {
-	ip, ok := v.(net.IP)
+	ip, ok := v.(netip.Addr)
 	if !ok {
-		return nil, fmt.Errorf("value for rr type %s has type %T, not net.IP", dns.Type(rr), v)
+		return nil, fmt.Errorf("value for rr type %s has type %T, not netip.Addr", dns.Type(rr), v)
 	}
 
 	if rr == dns.TypeA {
-		return s.genAnswerA(req, ip.To4()), nil
+		return s.genAnswerA(req, ip), nil
 	}
 
 	return s.genAnswerAAAA(req, ip), nil
@@ -97,6 +98,7 @@ func (s *Server) ansFromDNSRewriteMX(
 // ansFromDNSRewriteSVCB creates a new answer resource record from the
 // SVCB/HTTPS dnsrewrite rule data.
 func (s *Server) ansFromDNSRewriteSVCB(
+	ctx context.Context,
 	v rules.RRValue,
 	rr rules.RRType,
 	req *dns.Msg,
@@ -111,10 +113,10 @@ func (s *Server) ansFromDNSRewriteSVCB(
 	}
 
 	if rr == dns.TypeHTTPS {
-		return s.genAnswerHTTPS(req, svcb), nil
+		return s.genAnswerHTTPS(ctx, req, svcb), nil
 	}
 
-	return s.genAnswerSVCB(req, svcb), nil
+	return s.genAnswerSVCB(ctx, req, svcb), nil
 }
 
 // ansFromDNSRewriteSRV creates a new answer resource record from the SRV
@@ -139,11 +141,12 @@ func (s *Server) ansFromDNSRewriteSRV(
 // filterDNSRewrite handles dnsrewrite filters.  It constructs a DNS response
 // and sets it into pctx.Res.  All parameters must not be nil.
 func (s *Server) filterDNSRewrite(
+	ctx context.Context,
 	req *dns.Msg,
 	res *filtering.Result,
 	pctx *proxy.DNSContext,
 ) (err error) {
-	resp := s.makeResponse(req)
+	resp := s.replyCompressed(req)
 	dnsrr := res.DNSRewriteResult
 	if dnsrr == nil {
 		return errors.Error("no dns rewrite rule content")
@@ -160,13 +163,13 @@ func (s *Server) filterDNSRewrite(
 		return errors.Error("no dns rewrite rule responses")
 	}
 
-	rr := req.Question[0].Qtype
-	values := dnsrr.Response[rr]
+	qtype := req.Question[0].Qtype
+	values := dnsrr.Response[qtype]
 	for i, v := range values {
 		var ans dns.RR
-		ans, err = s.filterDNSRewriteResponse(req, rr, v)
+		ans, err = s.filterDNSRewriteResponse(ctx, req, qtype, v)
 		if err != nil {
-			return fmt.Errorf("dns rewrite response for %d[%d]: %w", rr, i, err)
+			return fmt.Errorf("dns rewrite response for %s[%d]: %w", dns.Type(qtype), i, err)
 		}
 
 		resp.Answer = append(resp.Answer, ans)

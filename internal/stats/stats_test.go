@@ -9,10 +9,15 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghtest"
 	"github.com/AdguardTeam/AdGuardHome/internal/stats"
+	"github.com/AdguardTeam/dnsproxy/proxy"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
-	"github.com/AdguardTeam/golibs/stringutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/AdguardTeam/golibs/timeutil"
 	"github.com/miekg/dns"
@@ -20,32 +25,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMain(m *testing.M) {
-	testutil.DiscardLogOutput(m)
-}
-
 // constUnitID is the UnitIDGenFunc which always return 0.
 func constUnitID() (id uint32) { return 0 }
 
-func assertSuccessAndUnmarshal(t *testing.T, to any, handler http.Handler, req *http.Request) {
-	t.Helper()
+func assertSuccessAndUnmarshal(tb testing.TB, to any, handler http.Handler, req *http.Request) {
+	tb.Helper()
 
-	require.NotNil(t, handler)
+	require.NotNil(tb, handler)
 
 	rw := httptest.NewRecorder()
 
 	handler.ServeHTTP(rw, req)
-	require.Equal(t, http.StatusOK, rw.Code)
+	require.Equal(tb, http.StatusOK, rw.Code)
 
 	data := rw.Body.Bytes()
 	if to == nil {
-		assert.Empty(t, data)
+		assert.Empty(tb, data)
 
 		return
 	}
 
 	err := json.Unmarshal(data, to)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 }
 
 func TestStats(t *testing.T) {
@@ -54,13 +55,16 @@ func TestStats(t *testing.T) {
 
 	handlers := map[string]http.Handler{}
 	conf := stats.Config{
+		Logger:            slogutil.NewDiscardLogger(),
 		ShouldCountClient: func([]string) bool { return true },
 		Filename:          filepath.Join(t.TempDir(), "stats.db"),
 		Limit:             timeutil.Day,
 		Enabled:           true,
 		UnitID:            constUnitID,
-		HTTPRegister: func(_, url string, handler http.HandlerFunc) {
-			handlers[url] = handler
+		HTTPReg: &aghtest.Registrar{
+			OnRegister: func(_, url string, handler http.HandlerFunc) {
+				handlers[url] = handler
+			},
 		},
 	}
 
@@ -72,24 +76,35 @@ func TestStats(t *testing.T) {
 
 	t.Run("data", func(t *testing.T) {
 		const reqDomain = "domain"
+		const respUpstream = "upstream"
 
-		entries := []stats.Entry{{
-			Domain: reqDomain,
-			Client: cliIPStr,
-			Result: stats.RFiltered,
-			Time:   123456,
+		entries := []*stats.Entry{{
+			Domain:         reqDomain,
+			Client:         cliIPStr,
+			Result:         stats.RFiltered,
+			ProcessingTime: time.Microsecond * 123456,
+			UpstreamStats: []*proxy.UpstreamStatistics{{
+				Address:       respUpstream,
+				QueryDuration: time.Microsecond * 222222,
+			}},
 		}, {
-			Domain: reqDomain,
-			Client: cliIPStr,
-			Result: stats.RNotFiltered,
-			Time:   123456,
+			Domain:         reqDomain,
+			Client:         cliIPStr,
+			Result:         stats.RNotFiltered,
+			ProcessingTime: time.Microsecond * 123456,
+			UpstreamStats: []*proxy.UpstreamStatistics{{
+				Address:       respUpstream,
+				QueryDuration: time.Microsecond * 222222,
+			}},
 		}}
 
 		wantData := &stats.StatsResp{
-			TimeUnits:  "hours",
-			TopQueried: []map[string]uint64{0: {reqDomain: 1}},
-			TopClients: []map[string]uint64{0: {cliIPStr: 2}},
-			TopBlocked: []map[string]uint64{0: {reqDomain: 1}},
+			TimeUnits:             "hours",
+			TopQueried:            []map[string]uint64{0: {reqDomain: 1}},
+			TopClients:            []map[string]uint64{0: {cliIPStr: 2}},
+			TopBlocked:            []map[string]uint64{0: {reqDomain: 1}},
+			TopUpstreamsResponses: []map[string]uint64{0: {respUpstream: 2}},
+			TopUpstreamsAvgTime:   []map[string]float64{0: {respUpstream: 0.222222}},
 			DNSQueries: []uint64{
 				0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 				0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
@@ -138,14 +153,16 @@ func TestStats(t *testing.T) {
 
 		_24zeroes := [24]uint64{}
 		emptyData := &stats.StatsResp{
-			TimeUnits:            "hours",
-			TopQueried:           []map[string]uint64{},
-			TopClients:           []map[string]uint64{},
-			TopBlocked:           []map[string]uint64{},
-			DNSQueries:           _24zeroes[:],
-			BlockedFiltering:     _24zeroes[:],
-			ReplacedSafebrowsing: _24zeroes[:],
-			ReplacedParental:     _24zeroes[:],
+			TimeUnits:             "hours",
+			TopQueried:            []map[string]uint64{},
+			TopClients:            []map[string]uint64{},
+			TopBlocked:            []map[string]uint64{},
+			TopUpstreamsResponses: []map[string]uint64{},
+			TopUpstreamsAvgTime:   []map[string]float64{},
+			DNSQueries:            _24zeroes[:],
+			BlockedFiltering:      _24zeroes[:],
+			ReplacedSafebrowsing:  _24zeroes[:],
+			ReplacedParental:      _24zeroes[:],
 		}
 
 		req = httptest.NewRequest(http.MethodGet, "/control/stats", nil)
@@ -161,12 +178,17 @@ func TestLargeNumbers(t *testing.T) {
 	handlers := map[string]http.Handler{}
 
 	conf := stats.Config{
+		Logger:            slogutil.NewDiscardLogger(),
 		ShouldCountClient: func([]string) bool { return true },
 		Filename:          filepath.Join(t.TempDir(), "stats.db"),
 		Limit:             timeutil.Day,
 		Enabled:           true,
 		UnitID:            func() (id uint32) { return atomic.LoadUint32(&curHour) },
-		HTTPRegister:      func(_, url string, handler http.HandlerFunc) { handlers[url] = handler },
+		HTTPReg: &aghtest.Registrar{
+			OnRegister: func(_, url string, handler http.HandlerFunc) {
+				handlers[url] = handler
+			},
+		},
 	}
 
 	s, err := stats.New(conf)
@@ -185,13 +207,13 @@ func TestLargeNumbers(t *testing.T) {
 	for h := 0; h < hoursNum; h++ {
 		atomic.AddUint32(&curHour, 1)
 
-		for i := 0; i < cliNumPerHour; i++ {
+		for i := range cliNumPerHour {
 			ip := net.IP{127, 0, byte((i & 0xff00) >> 8), byte(i & 0xff)}
-			e := stats.Entry{
-				Domain: fmt.Sprintf("domain%d.hour%d", i, h),
-				Client: ip.String(),
-				Result: stats.RNotFiltered,
-				Time:   123456,
+			e := &stats.Entry{
+				Domain:         fmt.Sprintf("domain%d.hour%d", i, h),
+				Client:         ip.String(),
+				Result:         stats.RNotFiltered,
+				ProcessingTime: 123456,
 			}
 			s.Update(e)
 		}
@@ -207,16 +229,20 @@ func TestShouldCount(t *testing.T) {
 		ignored1 = "ignor.ed"
 		ignored2 = "ignored.to"
 	)
-	set := stringutil.NewSet(ignored1, ignored2)
+	ignored := []string{ignored1, ignored2}
+	engine, err := aghnet.NewIgnoreEngine(ignored, true)
+	require.NoError(t, err)
 
 	s, err := stats.New(stats.Config{
+		Logger:   slogutil.NewDiscardLogger(),
 		Enabled:  true,
 		Filename: filepath.Join(t.TempDir(), "stats.db"),
 		Limit:    timeutil.Day,
-		Ignored:  set,
+		Ignored:  engine,
 		ShouldCountClient: func(ids []string) (a bool) {
 			return ids[0] != "no_count"
 		},
+		HTTPReg: aghhttp.EmptyRegistrar{},
 	})
 	require.NoError(t, err)
 

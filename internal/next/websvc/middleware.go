@@ -7,8 +7,6 @@ import (
 	"github.com/AdguardTeam/golibs/httphdr"
 )
 
-// Middlewares
-
 // jsonMw sets the content type of the response to application/json.
 func jsonMw(h http.Handler) (wrapped http.HandlerFunc) {
 	f := func(w http.ResponseWriter, r *http.Request) {

@@ -1,18 +1,19 @@
 package updater
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
-	"github.com/AdguardTeam/AdGuardHome/internal/aghio"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
+	"github.com/AdguardTeam/golibs/ioutil"
+	"github.com/c2h5oh/datasize"
 )
 
 // TODO(a.garipov): Make configurable.
@@ -28,12 +29,13 @@ type VersionInfo struct {
 	CanAutoUpdate aghalg.NullBool `json:"can_autoupdate,omitempty"`
 }
 
-// MaxResponseSize is responses on server's requests maximum length in bytes.
-const MaxResponseSize = 64 * 1024
+// maxVersionRespSize is the maximum length in bytes for version information
+// response.
+const maxVersionRespSize datasize.ByteSize = 64 * datasize.KB
 
 // VersionInfo downloads the latest version information.  If forceRecheck is
 // false and there are cached results, those results are returned.
-func (u *Updater) VersionInfo(forceRecheck bool) (vi VersionInfo, err error) {
+func (u *Updater) VersionInfo(ctx context.Context, forceRecheck bool) (vi VersionInfo, err error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -43,34 +45,36 @@ func (u *Updater) VersionInfo(forceRecheck bool) (vi VersionInfo, err error) {
 		return u.prevCheckResult, u.prevCheckError
 	}
 
-	var resp *http.Response
 	vcu := u.versionCheckURL
-	resp, err = u.client.Get(vcu)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, vcu, nil)
 	if err != nil {
-		return VersionInfo{}, fmt.Errorf("updater: HTTP GET %s: %w", vcu, err)
+		return VersionInfo{}, fmt.Errorf("constructing request to %s: %w", vcu, err)
+	}
+
+	u.logger.DebugContext(ctx, "requesting version data", "url", vcu)
+
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return VersionInfo{}, fmt.Errorf("requesting %s: %w", vcu, err)
 	}
 	defer func() { err = errors.WithDeferred(err, resp.Body.Close()) }()
 
-	var r io.Reader
-	r, err = aghio.LimitReader(resp.Body, MaxResponseSize)
-	if err != nil {
-		return VersionInfo{}, fmt.Errorf("updater: LimitReadCloser: %w", err)
-	}
+	r := ioutil.LimitReader(resp.Body, maxVersionRespSize.Bytes())
 
 	// This use of ReadAll is safe, because we just limited the appropriate
 	// ReadCloser.
 	body, err := io.ReadAll(r)
 	if err != nil {
-		return VersionInfo{}, fmt.Errorf("updater: HTTP GET %s: %w", vcu, err)
+		return VersionInfo{}, fmt.Errorf("reading response from %s: %w", vcu, err)
 	}
 
 	u.prevCheckTime = now
-	u.prevCheckResult, u.prevCheckError = u.parseVersionResponse(body)
+	u.prevCheckResult, u.prevCheckError = u.parseVersionResponse(ctx, body)
 
 	return u.prevCheckResult, u.prevCheckError
 }
 
-func (u *Updater) parseVersionResponse(data []byte) (VersionInfo, error) {
+func (u *Updater) parseVersionResponse(ctx context.Context, data []byte) (VersionInfo, error) {
 	info := VersionInfo{
 		CanAutoUpdate: aghalg.NBFalse,
 	}
@@ -94,7 +98,7 @@ func (u *Updater) parseVersionResponse(data []byte) (VersionInfo, error) {
 	info.Announcement = versionJSON["announcement"]
 	info.AnnouncementURL = versionJSON["announcement_url"]
 
-	packageURL, key, found := u.downloadURL(versionJSON)
+	packageURL, key, found := u.downloadURL(ctx, versionJSON)
 	if !found {
 		return info, fmt.Errorf("version.json: no package URL: key %q not found in object", key)
 	}
@@ -110,7 +114,10 @@ func (u *Updater) parseVersionResponse(data []byte) (VersionInfo, error) {
 // downloadURL returns the download URL for current build as well as its key in
 // versionObj.  If the key is not found, it additionally prints an informative
 // log message.
-func (u *Updater) downloadURL(versionObj map[string]string) (dlURL, key string, ok bool) {
+func (u *Updater) downloadURL(
+	ctx context.Context,
+	versionObj map[string]string,
+) (dlURL, key string, ok bool) {
 	if u.goarch == "arm" && u.goarm != "" {
 		key = fmt.Sprintf("download_%s_%sv%s", u.goos, u.goarch, u.goarm)
 	} else if isMIPS(u.goarch) && u.gomips != "" {
@@ -124,9 +131,9 @@ func (u *Updater) downloadURL(versionObj map[string]string) (dlURL, key string, 
 		return dlURL, key, true
 	}
 
-	keys := maps.Keys(versionObj)
-	slices.Sort(keys)
-	log.Error("updater: key %q not found; got keys %q", key, keys)
+	keys := slices.Sorted(maps.Keys(versionObj))
+
+	u.logger.ErrorContext(ctx, "key not found", "missing", key, "got", keys)
 
 	return "", key, false
 }

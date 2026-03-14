@@ -3,19 +3,27 @@
 package dhcpd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
+	"github.com/AdguardTeam/AdGuardHome/internal/dhcpsvc"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/netutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
 )
 
 type v4ServerConfJSON struct {
@@ -74,7 +82,7 @@ type leaseStatic struct {
 }
 
 // leasesToStatic converts list of leases to their JSON form.
-func leasesToStatic(leases []*Lease) (static []*leaseStatic) {
+func leasesToStatic(leases []*dhcpsvc.Lease) (static []*leaseStatic) {
 	static = make([]*leaseStatic, len(leases))
 
 	for i, l := range leases {
@@ -89,13 +97,13 @@ func leasesToStatic(leases []*Lease) (static []*leaseStatic) {
 }
 
 // toLease converts leaseStatic to Lease or returns error.
-func (l *leaseStatic) toLease() (lease *Lease, err error) {
+func (l *leaseStatic) toLease() (lease *dhcpsvc.Lease, err error) {
 	addr, err := net.ParseMAC(l.HWAddr)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't parse MAC address: %w", err)
 	}
 
-	return &Lease{
+	return &dhcpsvc.Lease{
 		HWAddr:   addr,
 		IP:       l.IP,
 		Hostname: l.Hostname,
@@ -112,7 +120,7 @@ type leaseDynamic struct {
 }
 
 // leasesToDynamic converts list of leases to their JSON form.
-func leasesToDynamic(leases []*Lease) (dynamic []*leaseDynamic) {
+func leasesToDynamic(leases []*dhcpsvc.Lease) (dynamic []*leaseDynamic) {
 	dynamic = make([]*leaseDynamic, len(leases))
 
 	for i, l := range leases {
@@ -142,15 +150,35 @@ func (s *server) handleDHCPStatus(w http.ResponseWriter, r *http.Request) {
 	s.srv4.WriteDiskConfig4(&status.V4)
 	s.srv6.WriteDiskConfig6(&status.V6)
 
-	status.Leases = leasesToDynamic(s.Leases(LeasesDynamic))
-	status.StaticLeases = leasesToStatic(s.Leases(LeasesStatic))
+	leases := s.Leases()
+	slices.SortFunc(leases, func(a, b *dhcpsvc.Lease) (res int) {
+		if a.IsStatic == b.IsStatic {
+			return 0
+		} else if a.IsStatic {
+			return -1
+		} else {
+			return 1
+		}
+	})
 
-	_ = aghhttp.WriteJSONResponse(w, r, status)
+	dynamicIdx := slices.IndexFunc(leases, func(l *dhcpsvc.Lease) (ok bool) {
+		return !l.IsStatic
+	})
+
+	if dynamicIdx == -1 {
+		dynamicIdx = len(leases)
+	}
+
+	status.Leases = leasesToDynamic(leases[dynamicIdx:])
+	status.StaticLeases = leasesToStatic(leases[:dynamicIdx])
+
+	aghhttp.WriteJSONResponseOK(r.Context(), s.conf.Logger, w, r, status)
 }
 
-func (s *server) enableDHCP(ifaceName string) (code int, err error) {
+func (s *server) enableDHCP(ctx context.Context, ifaceName string) (code int, err error) {
 	var hasStaticIP bool
-	hasStaticIP, err = aghnet.IfaceHasStaticIP(ifaceName)
+	cmdCons := s.conf.CommandConstructor
+	hasStaticIP, err = aghnet.IfaceHasStaticIP(ctx, cmdCons, ifaceName)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
 			// ErrPermission may happen here on Linux systems where AdGuard Home
@@ -179,7 +207,7 @@ func (s *server) enableDHCP(ifaceName string) (code int, err error) {
 	}
 
 	if !hasStaticIP {
-		err = aghnet.IfaceSetStaticIP(ifaceName)
+		err = aghnet.IfaceSetStaticIP(ctx, s.conf.Logger, cmdCons, ifaceName)
 		if err != nil {
 			err = fmt.Errorf("setting static ip: %w", err)
 
@@ -187,7 +215,7 @@ func (s *server) enableDHCP(ifaceName string) (code int, err error) {
 		}
 	}
 
-	err = s.Start()
+	err = s.Start(ctx)
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("starting dhcp server: %w", err)
 	}
@@ -216,6 +244,7 @@ func (s *server) handleDHCPSetConfigV4(
 	}
 
 	v4Conf.InterfaceName = conf.InterfaceName
+	v4Conf.Logger = s.conf.Logger.With("ip_version", "4")
 
 	// Set the default values for the fields not configurable via web API.
 	c4 := &V4ServerConf{
@@ -256,6 +285,7 @@ func (s *server) handleDHCPSetConfigV6(
 
 	enabled = v6Conf.Enabled
 	v6Conf.InterfaceName = conf.InterfaceName
+	v6Conf.Logger = s.conf.Logger.With("ip_version", "6")
 	v6Conf.notify = s.onNotify
 
 	srv6, err = v6Create(v6Conf)
@@ -263,60 +293,88 @@ func (s *server) handleDHCPSetConfigV6(
 	return srv6, enabled, err
 }
 
+// createServers returns DHCPv4 and DHCPv6 servers created from the provided
+// configuration conf.
+func (s *server) createServers(conf *dhcpServerConfigJSON) (srv4, srv6 DHCPServer, err error) {
+	srv4, v4Enabled, err := s.handleDHCPSetConfigV4(conf)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bad dhcpv4 configuration: %w", err)
+	}
+
+	srv6, v6Enabled, err := s.handleDHCPSetConfigV6(conf)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bad dhcpv6 configuration: %w", err)
+	}
+
+	if conf.Enabled == aghalg.NBTrue && !v4Enabled && !v6Enabled {
+		return nil, nil, fmt.Errorf("dhcpv4 or dhcpv6 configuration must be complete")
+	}
+
+	return srv4, srv6, nil
+}
+
+// handleDHCPSetConfig is the handler for the POST /control/dhcp/set_config
+// HTTP API.
 func (s *server) handleDHCPSetConfig(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := s.conf.Logger
+
 	conf := &dhcpServerConfigJSON{}
 	conf.Enabled = aghalg.BoolToNullBool(s.conf.Enabled)
 	conf.InterfaceName = s.conf.InterfaceName
 
 	err := json.NewDecoder(r.Body).Decode(conf)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "failed to parse new dhcp config json: %s", err)
+		aghhttp.ErrorAndLog(
+			ctx,
+			l,
+			r,
+			w,
+			http.StatusBadRequest,
+			"failed to parse new dhcp config json: %s",
+			err,
+		)
 
 		return
 	}
 
-	srv4, v4Enabled, err := s.handleDHCPSetConfigV4(conf)
+	srv4, srv6, err := s.createServers(conf)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "bad dhcpv4 configuration: %s", err)
-
-		return
-	}
-
-	srv6, v6Enabled, err := s.handleDHCPSetConfigV6(conf)
-	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "bad dhcpv6 configuration: %s", err)
-
-		return
-	}
-
-	if conf.Enabled == aghalg.NBTrue && !v4Enabled && !v6Enabled {
-		aghhttp.Error(r, w, http.StatusBadRequest, "dhcpv4 or dhcpv6 configuration must be complete")
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
 
 	err = s.Stop()
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusInternalServerError, "stopping dhcp: %s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusInternalServerError, "stopping dhcp: %s", err)
 
 		return
 	}
 
 	s.setConfFromJSON(conf, srv4, srv6)
-	s.conf.ConfigModified()
+	s.conf.ConfModifier.Apply(ctx)
 
 	err = s.dbLoad()
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusInternalServerError, "loading leases db: %s", err)
+		aghhttp.ErrorAndLog(
+			ctx,
+			l,
+			r,
+			w,
+			http.StatusInternalServerError,
+			"loading leases db: %s",
+			err,
+		)
 
 		return
 	}
 
 	if s.conf.Enabled {
 		var code int
-		code, err = s.enableDHCP(conf.InterfaceName)
+		code, err = s.enableDHCP(ctx, conf.InterfaceName)
 		if err != nil {
-			aghhttp.Error(r, w, code, "enabling dhcp: %s", err)
+			aghhttp.ErrorAndLog(ctx, l, r, w, code, "enabling dhcp: %s", err)
 		}
 	}
 }
@@ -350,87 +408,117 @@ type netInterfaceJSON struct {
 	Addrs6       []netip.Addr `json:"ipv6_addresses"`
 }
 
-// handleDHCPInterfaces is the handler for the GET /control/dhcp/interfaces HTTP
-// API.
+// handleDHCPInterfaces is the handler for the GET /control/dhcp/interfaces
+// HTTP API.
 func (s *server) handleDHCPInterfaces(w http.ResponseWriter, r *http.Request) {
-	resp := map[string]netInterfaceJSON{}
+	ctx := r.Context()
+	l := s.conf.Logger
+
+	resp := map[string]*netInterfaceJSON{}
 
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusInternalServerError, "Couldn't get interfaces: %s", err)
+		aghhttp.ErrorAndLog(
+			ctx,
+			l,
+			r,
+			w,
+			http.StatusInternalServerError,
+			"Couldn't get interfaces: %s",
+			err,
+		)
 
 		return
 	}
 
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagLoopback != 0 {
-			// it's a loopback, skip it
-			continue
-		}
-		if iface.Flags&net.FlagBroadcast == 0 {
-			// this interface doesn't support broadcast, skip it
+			// It's a loopback, skip it.
 			continue
 		}
 
-		var addrs []net.Addr
-		addrs, err = iface.Addrs()
-		if err != nil {
-			aghhttp.Error(
-				r,
-				w,
-				http.StatusInternalServerError,
-				"Failed to get addresses for interface %s: %s",
-				iface.Name,
-				err,
-			)
+		if iface.Flags&net.FlagBroadcast == 0 {
+			// This interface doesn't support broadcast, skip it.
+			continue
+		}
+
+		jsonIface, iErr := newNetInterfaceJSON(ctx, s.conf.Logger, iface, s.conf.CommandConstructor)
+		if iErr != nil {
+			aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusInternalServerError, "%s", iErr)
 
 			return
 		}
 
-		jsonIface := netInterfaceJSON{
-			Name:         iface.Name,
-			HardwareAddr: iface.HardwareAddr.String(),
-		}
-
-		if iface.Flags != 0 {
-			jsonIface.Flags = iface.Flags.String()
-		}
-		// we don't want link-local addresses in json, so skip them
-		for _, addr := range addrs {
-			ipnet, ok := addr.(*net.IPNet)
-			if !ok {
-				// not an IPNet, should not happen
-				aghhttp.Error(
-					r,
-					w,
-					http.StatusInternalServerError,
-					"got iface.Addrs() element %[1]s that is not net.IPNet, it is %[1]T",
-					addr)
-
-				return
-			}
-			// ignore link-local
-			//
-			// TODO(e.burkov):  Try to listen DHCP on LLA as well.
-			if ipnet.IP.IsLinkLocalUnicast() {
-				continue
-			}
-
-			if ip4 := ipnet.IP.To4(); ip4 != nil {
-				addr := netip.AddrFrom4(*(*[4]byte)(ip4))
-				jsonIface.Addrs4 = append(jsonIface.Addrs4, addr)
-			} else {
-				addr := netip.AddrFrom16(*(*[16]byte)(ipnet.IP))
-				jsonIface.Addrs6 = append(jsonIface.Addrs6, addr)
-			}
-		}
-		if len(jsonIface.Addrs4)+len(jsonIface.Addrs6) != 0 {
-			jsonIface.GatewayIP = aghnet.GatewayIP(iface.Name)
+		if jsonIface != nil {
 			resp[iface.Name] = jsonIface
 		}
 	}
 
-	_ = aghhttp.WriteJSONResponse(w, r, resp)
+	aghhttp.WriteJSONResponseOK(ctx, l, w, r, resp)
+}
+
+// newNetInterfaceJSON creates a JSON object from a [net.Interface] iface.
+// l and cmdCons must not be nil.
+func newNetInterfaceJSON(
+	ctx context.Context,
+	l *slog.Logger,
+	iface net.Interface,
+	cmdCons executil.CommandConstructor,
+) (out *netInterfaceJSON, err error) {
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get addresses for interface %s: %w",
+			iface.Name,
+			err,
+		)
+	}
+
+	out = &netInterfaceJSON{
+		Name:         iface.Name,
+		HardwareAddr: iface.HardwareAddr.String(),
+	}
+
+	if iface.Flags != 0 {
+		out.Flags = iface.Flags.String()
+	}
+
+	// We don't want link-local addresses in JSON, so skip them.
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			// Not an IPNet, should not happen.
+			return nil, fmt.Errorf("got iface.Addrs() element %[1]s that is not"+
+				" net.IPNet, it is %[1]T", addr)
+		}
+
+		// Ignore link-local.
+		//
+		// TODO(e.burkov):  Try to listen DHCP on LLA as well.
+		if ipNet.IP.IsLinkLocalUnicast() {
+			continue
+		}
+
+		vAddr, iErr := netutil.IPToAddrNoMapped(ipNet.IP)
+		if iErr != nil {
+			// Not an IPNet, should not happen.
+			return nil, fmt.Errorf("failed to convert IP address %[1]s: %w", addr, iErr)
+		}
+
+		if vAddr.Is4() {
+			out.Addrs4 = append(out.Addrs4, vAddr)
+		} else {
+			out.Addrs6 = append(out.Addrs6, vAddr)
+		}
+	}
+
+	if len(out.Addrs4)+len(out.Addrs6) == 0 {
+		return nil, nil
+	}
+
+	out.GatewayIP = aghnet.GatewayIP(ctx, l, cmdCons, iface.Name)
+
+	return out, nil
 }
 
 // dhcpSearchOtherResult contains information about other DHCP server for
@@ -478,21 +566,24 @@ type findActiveServerReq struct {
 //  2. check if a static IP is configured for the network interface;
 //  3. responds with the results.
 func (s *server) handleDHCPFindActiveServer(w http.ResponseWriter, r *http.Request) {
-	if aghhttp.WriteTextPlainDeprecated(w, r) {
+	ctx := r.Context()
+	l := s.conf.Logger
+
+	if aghhttp.WriteTextPlainDeprecated(ctx, l, w, r) {
 		return
 	}
 
 	req := &findActiveServerReq{}
 	err := json.NewDecoder(r.Body).Decode(req)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "reading req: %s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "reading req: %s", err)
 
 		return
 	}
 
 	ifaceName := req.Interface
 	if ifaceName == "" {
-		aghhttp.Error(r, w, http.StatusBadRequest, "empty interface name")
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "empty interface name")
 
 		return
 	}
@@ -513,24 +604,29 @@ func (s *server) handleDHCPFindActiveServer(w http.ResponseWriter, r *http.Reque
 		},
 	}
 
-	if isStaticIP, serr := aghnet.IfaceHasStaticIP(ifaceName); serr != nil {
+	cmdCons := s.conf.CommandConstructor
+	if isStaticIP, serr := aghnet.IfaceHasStaticIP(ctx, cmdCons, ifaceName); serr != nil {
 		result.V4.StaticIP.Static = "error"
 		result.V4.StaticIP.Error = serr.Error()
 	} else if !isStaticIP {
 		result.V4.StaticIP.Static = "no"
 		// TODO(e.burkov):  The returned IP should only be of version 4.
-		result.V4.StaticIP.IP = aghnet.GetSubnet(ifaceName).String()
+		result.V4.StaticIP.IP = aghnet.GetSubnet(ctx, s.conf.Logger, ifaceName).String()
 	}
 
-	setOtherDHCPResult(ifaceName, result)
+	s.setOtherDHCPResult(ctx, ifaceName, result)
 
-	_ = aghhttp.WriteJSONResponse(w, r, result)
+	aghhttp.WriteJSONResponseOK(ctx, l, w, r, result)
 }
 
 // setOtherDHCPResult sets the results of the check for another DHCP server in
-// result.
-func setOtherDHCPResult(ifaceName string, result *dhcpSearchResult) {
-	found4, found6, err4, err6 := aghnet.CheckOtherDHCP(ifaceName)
+// result.  result must not be nil.
+func (s *server) setOtherDHCPResult(
+	ctx context.Context,
+	ifaceName string,
+	result *dhcpSearchResult,
+) {
+	found4, found6, err4, err6 := aghnet.CheckOtherDHCP(ctx, s.conf.Logger, ifaceName)
 	if err4 != nil {
 		result.V4.OtherServer.Found = "error"
 		result.V4.OtherServer.Error = err4.Error()
@@ -546,101 +642,111 @@ func setOtherDHCPResult(ifaceName string, result *dhcpSearchResult) {
 	}
 }
 
-func (s *server) handleDHCPAddStaticLease(w http.ResponseWriter, r *http.Request) {
+// parseLease parses a lease from r.  If there is no error returns DHCPServer
+// and *Lease.  r must be non-nil.
+func (s *server) parseLease(r io.Reader) (srv DHCPServer, lease *dhcpsvc.Lease, err error) {
 	l := &leaseStatic{}
-	err := json.NewDecoder(r.Body).Decode(l)
+	err = json.NewDecoder(r).Decode(l)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "json.Decode: %s", err)
-
-		return
+		return nil, nil, fmt.Errorf("decoding json: %w", err)
 	}
 
 	if !l.IP.IsValid() {
-		aghhttp.Error(r, w, http.StatusBadRequest, "invalid IP")
-
-		return
+		return nil, nil, errors.Error("invalid ip")
 	}
 
 	l.IP = l.IP.Unmap()
 
-	var srv DHCPServer
-	if l.IP.Is4() {
+	lease, err = l.toLease()
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing: %w", err)
+	}
+
+	if lease.IP.Is4() {
 		srv = s.srv4
 	} else {
 		srv = s.srv6
 	}
 
-	lease, err := l.toLease()
+	return srv, lease, nil
+}
+
+// handleDHCPAddStaticLease is the handler for the POST
+// /control/dhcp/add_static_lease HTTP API.
+func (s *server) handleDHCPAddStaticLease(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := s.conf.Logger
+
+	srv, lease, err := s.parseLease(r.Body)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "parsing: %s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
 
-	err = srv.AddStaticLease(lease)
-	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
-
-		return
+	if err = srv.AddStaticLease(lease); err != nil {
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 	}
 }
 
+// handleDHCPRemoveStaticLease is the handler for the POST
+// /control/dhcp/remove_static_lease HTTP API.
 func (s *server) handleDHCPRemoveStaticLease(w http.ResponseWriter, r *http.Request) {
-	l := &leaseStatic{}
-	err := json.NewDecoder(r.Body).Decode(l)
+	ctx := r.Context()
+	l := s.conf.Logger
+
+	srv, lease, err := s.parseLease(r.Body)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "json.Decode: %s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
 
-	if !l.IP.IsValid() {
-		aghhttp.Error(r, w, http.StatusBadRequest, "invalid IP")
-
-		return
+	if err = srv.RemoveStaticLease(lease); err != nil {
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 	}
+}
 
-	l.IP = l.IP.Unmap()
+// handleDHCPUpdateStaticLease is the handler for the POST
+// /control/dhcp/update_static_lease HTTP API.
+func (s *server) handleDHCPUpdateStaticLease(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := s.conf.Logger
 
-	var srv DHCPServer
-	if l.IP.Is4() {
-		srv = s.srv4
-	} else {
-		srv = s.srv6
-	}
-
-	lease, err := l.toLease()
+	srv, lease, err := s.parseLease(r.Body)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "parsing: %s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
 
-	err = srv.RemoveStaticLease(lease)
-	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
-
-		return
+	if err = srv.UpdateStaticLease(lease); err != nil {
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 	}
 }
 
 func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := s.conf.Logger
+
 	err := s.Stop()
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusInternalServerError, "stopping dhcp: %s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusInternalServerError, "stopping dhcp: %s", err)
 
 		return
 	}
 
 	err = os.Remove(s.conf.dbFilePath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Error("dhcp: removing db: %s", err)
+		l.ErrorContext(ctx, "failed to remove database file", slogutil.KeyError, err)
 	}
 
 	s.conf = &ServerConfig{
-		ConfigModified: s.conf.ConfigModified,
+		Logger:             l,
+		CommandConstructor: s.conf.CommandConstructor,
+		ConfModifier:       s.conf.ConfModifier,
 
-		HTTPRegister: s.conf.HTTPRegister,
+		HTTPReg: s.conf.HTTPReg,
 
 		LocalDomainName: s.conf.LocalDomainName,
 
@@ -649,6 +755,7 @@ func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	v4conf := &V4ServerConf{
+		Logger:        s.conf.Logger.With("ip_version", "4"),
 		LeaseDuration: DefaultDHCPLeaseTTL,
 		ICMPTimeout:   DefaultDHCPTimeoutICMP,
 		notify:        s.onNotify,
@@ -656,35 +763,39 @@ func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
 	s.srv4, _ = v4Create(v4conf)
 
 	v6conf := V6ServerConf{
+		Logger:        s.conf.Logger.With("ip_version", "6"),
 		LeaseDuration: DefaultDHCPLeaseTTL,
 		notify:        s.onNotify,
 	}
 	s.srv6, _ = v6Create(v6conf)
 
-	s.conf.ConfigModified()
+	s.conf.ConfModifier.Apply(ctx)
 }
 
 func (s *server) handleResetLeases(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
 	err := s.resetLeases()
 	if err != nil {
 		msg := "resetting leases: %s"
-		aghhttp.Error(r, w, http.StatusInternalServerError, msg, err)
+		aghhttp.ErrorAndLog(ctx, s.conf.Logger, r, w, http.StatusInternalServerError, msg, err)
 
 		return
 	}
 }
 
 func (s *server) registerHandlers() {
-	if s.conf.HTTPRegister == nil {
+	if s.conf.HTTPReg == nil {
 		return
 	}
 
-	s.conf.HTTPRegister(http.MethodGet, "/control/dhcp/status", s.handleDHCPStatus)
-	s.conf.HTTPRegister(http.MethodGet, "/control/dhcp/interfaces", s.handleDHCPInterfaces)
-	s.conf.HTTPRegister(http.MethodPost, "/control/dhcp/set_config", s.handleDHCPSetConfig)
-	s.conf.HTTPRegister(http.MethodPost, "/control/dhcp/find_active_dhcp", s.handleDHCPFindActiveServer)
-	s.conf.HTTPRegister(http.MethodPost, "/control/dhcp/add_static_lease", s.handleDHCPAddStaticLease)
-	s.conf.HTTPRegister(http.MethodPost, "/control/dhcp/remove_static_lease", s.handleDHCPRemoveStaticLease)
-	s.conf.HTTPRegister(http.MethodPost, "/control/dhcp/reset", s.handleReset)
-	s.conf.HTTPRegister(http.MethodPost, "/control/dhcp/reset_leases", s.handleResetLeases)
+	s.conf.HTTPReg.Register(http.MethodGet, "/control/dhcp/status", s.handleDHCPStatus)
+	s.conf.HTTPReg.Register(http.MethodGet, "/control/dhcp/interfaces", s.handleDHCPInterfaces)
+	s.conf.HTTPReg.Register(http.MethodPost, "/control/dhcp/set_config", s.handleDHCPSetConfig)
+	s.conf.HTTPReg.Register(http.MethodPost, "/control/dhcp/find_active_dhcp", s.handleDHCPFindActiveServer)
+	s.conf.HTTPReg.Register(http.MethodPost, "/control/dhcp/add_static_lease", s.handleDHCPAddStaticLease)
+	s.conf.HTTPReg.Register(http.MethodPost, "/control/dhcp/remove_static_lease", s.handleDHCPRemoveStaticLease)
+	s.conf.HTTPReg.Register(http.MethodPost, "/control/dhcp/update_static_lease", s.handleDHCPUpdateStaticLease)
+	s.conf.HTTPReg.Register(http.MethodPost, "/control/dhcp/reset", s.handleReset)
+	s.conf.HTTPReg.Register(http.MethodPost, "/control/dhcp/reset_leases", s.handleResetLeases)
 }

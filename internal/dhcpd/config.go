@@ -1,31 +1,47 @@
 package dhcpd
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
+	"github.com/AdguardTeam/AdGuardHome/internal/dhcpsvc"
 	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/osutil/executil"
 )
 
 // ServerConfig is the configuration for the DHCP server.  The order of YAML
 // fields is important, since the YAML configuration file follows it.
 type ServerConfig struct {
-	// Called when the configuration is changed by HTTP request
-	ConfigModified func() `yaml:"-"`
+	// Logger is used for logging the operation of the DHCP server.  It must not
+	// be nil.
+	Logger *slog.Logger `yaml:"-"`
+
+	// CommandConstructor is used to run external commands.  It must not be nil.
+	CommandConstructor executil.CommandConstructor `yaml:"-"`
+
+	// ConfModifier is used to update the global configuration.  It must not be
+	// nil.
+	ConfModifier agh.ConfigModifier `yaml:"-"`
 
 	// Register an HTTP handler
-	HTTPRegister aghhttp.RegisterFunc `yaml:"-"`
+	HTTPReg aghhttp.Registrar `yaml:"-"`
 
 	Enabled       bool   `yaml:"enabled"`
 	InterfaceName string `yaml:"interface_name"`
 
-	// LocalDomainName is the domain name used for DHCP hosts.  For example,
-	// a DHCP client with the hostname "myhost" can be addressed as "myhost.lan"
+	// LocalDomainName is the domain name used for DHCP hosts.  For example, a
+	// DHCP client with the hostname "myhost" can be addressed as "myhost.lan"
 	// when LocalDomainName is "lan".
+	//
+	// TODO(e.burkov):  Probably, remove this field.  See the TODO on
+	// [Interface.Enabled].
 	LocalDomainName string `yaml:"local_domain_name"`
 
 	Conf4 V4ServerConf `yaml:"dhcpv4"`
@@ -46,17 +62,28 @@ type ServerConfig struct {
 // DHCPServer - DHCP server interface
 type DHCPServer interface {
 	// ResetLeases resets leases.
-	ResetLeases(leases []*Lease) (err error)
+	ResetLeases(leases []*dhcpsvc.Lease) (err error)
 	// GetLeases returns deep clones of the current leases.
-	GetLeases(flags GetLeasesFlags) (leases []*Lease)
+	GetLeases(flags GetLeasesFlags) (leases []*dhcpsvc.Lease)
 	// AddStaticLease - add a static lease
-	AddStaticLease(l *Lease) (err error)
+	AddStaticLease(l *dhcpsvc.Lease) (err error)
 	// RemoveStaticLease - remove a static lease
-	RemoveStaticLease(l *Lease) (err error)
+	RemoveStaticLease(l *dhcpsvc.Lease) (err error)
+
+	// UpdateStaticLease updates IP, hostname of the lease.
+	UpdateStaticLease(l *dhcpsvc.Lease) (err error)
 
 	// FindMACbyIP returns a MAC address by the IP address of its lease, if
 	// there is one.
 	FindMACbyIP(ip netip.Addr) (mac net.HardwareAddr)
+
+	// HostByIP returns a hostname by the IP address of its lease, if there is
+	// one.
+	HostByIP(ip netip.Addr) (host string)
+
+	// IPByHost returns an IP address by the hostname of its lease, if there is
+	// one.
+	IPByHost(host string) (ip netip.Addr)
 
 	// WriteDiskConfig4 - copy disk configuration
 	WriteDiskConfig4(c *V4ServerConf)
@@ -64,14 +91,18 @@ type DHCPServer interface {
 	WriteDiskConfig6(c *V6ServerConf)
 
 	// Start - start server
-	Start() (err error)
+	Start(ctx context.Context) (err error)
 	// Stop - stop server
 	Stop() (err error)
-	getLeasesRef() []*Lease
+	getLeasesRef() []*dhcpsvc.Lease
 }
 
 // V4ServerConf - server configuration
 type V4ServerConf struct {
+	// Logger is used for logging the operation of the DHCPv4 server.  It must
+	// not be nil.
+	Logger *slog.Logger `yaml:"-" json:"-"`
+
 	Enabled       bool   `yaml:"-" json:"-"`
 	InterfaceName string `yaml:"-" json:"-"`
 
@@ -211,6 +242,10 @@ func (c *V4ServerConf) Validate() (err error) {
 
 // V6ServerConf - server configuration
 type V6ServerConf struct {
+	// Logger is used for logging the operation of the DHCPv6 server.  It must
+	// not be nil.
+	Logger *slog.Logger `yaml:"-" json:"-"`
+
 	Enabled       bool   `yaml:"-" json:"-"`
 	InterfaceName string `yaml:"-" json:"-"`
 

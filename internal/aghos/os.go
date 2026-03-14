@@ -5,41 +5,35 @@ package aghos
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
-	"os/exec"
 	"path"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
-	"github.com/AdguardTeam/golibs/mathutil"
-	"golang.org/x/exp/slices"
+	"github.com/AdguardTeam/golibs/ioutil"
+	"github.com/AdguardTeam/golibs/osutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
 )
 
-// UnsupportedError is returned by functions and methods when a particular
-// operation Op cannot be performed on the current OS.
-type UnsupportedError struct {
-	Op string
-	OS string
-}
+// Default file, binary, and directory permissions.
+const (
+	DefaultPermDir  fs.FileMode = 0o700
+	DefaultPermExe  fs.FileMode = 0o700
+	DefaultPermFile fs.FileMode = 0o600
+)
 
-// Error implements the error interface for *UnsupportedError.
-func (err *UnsupportedError) Error() (msg string) {
-	return fmt.Sprintf("%s is unsupported on %s", err.Op, err.OS)
-}
-
-// Unsupported is a helper that returns an *UnsupportedError with the Op field
-// set to op and the OS field set to the current OS.
+// Unsupported is a helper that returns a wrapped [errors.ErrUnsupported].
 func Unsupported(op string) (err error) {
-	return &UnsupportedError{
-		Op: op,
-		OS: runtime.GOOS,
-	}
+	return fmt.Errorf("%s: not supported on %s: %w", op, runtime.GOOS, errors.ErrUnsupported)
 }
 
 // SetRlimit sets user-specified limit of how many fd's we can use.
@@ -59,49 +53,89 @@ func HaveAdminRights() (bool, error) {
 const MaxCmdOutputSize = 64 * 1024
 
 // RunCommand runs shell command.
-func RunCommand(command string, arguments ...string) (code int, output []byte, err error) {
-	cmd := exec.Command(command, arguments...)
-	out, err := cmd.Output()
+//
+// TODO(s.chzhen):  Consider removing this after addressing the current behavior
+// where a non-zero exit code is returned together with a nil error.
+func RunCommand(
+	ctx context.Context,
+	cmdCons executil.CommandConstructor,
+	command string,
+	arguments ...string,
+) (code int, output []byte, err error) {
+	stdoutBuf := bytes.Buffer{}
+	stderrBuf := bytes.Buffer{}
 
-	out = out[:mathutil.Min(len(out), MaxCmdOutputSize)]
+	err = executil.Run(
+		ctx,
+		cmdCons,
+		&executil.CommandConfig{
+			Path:   command,
+			Args:   arguments,
+			Stdout: ioutil.NewTruncatedWriter(&stdoutBuf, MaxCmdOutputSize),
+			Stderr: &stderrBuf,
+		},
+	)
 
-	if err != nil {
-		if eerr := new(exec.ExitError); errors.As(err, &eerr) {
-			return eerr.ExitCode(), eerr.Stderr, nil
-		}
-
-		return 1, nil, fmt.Errorf("command %q failed: %w: %s", command, err, out)
+	if err == nil {
+		return osutil.ExitCodeSuccess, stdoutBuf.Bytes(), nil
 	}
 
-	return cmd.ProcessState.ExitCode(), out, nil
+	code, ok := executil.ExitCodeFromError(err)
+	if ok {
+		// Mirror the old behavior and return a nil-error on non-zero code
+		// status.
+		return code, stderrBuf.Bytes(), nil
+	}
+
+	code = osutil.ExitCodeFailure
+
+	return code, nil, fmt.Errorf("command %q failed: %w: %s", command, err, &stdoutBuf)
 }
 
+// psArgs holds the default ps arguments to avoid per-call slice allocations.
+//
+// Don't use -C flag here since it's a feature of linux's ps
+// implementation.  Use POSIX-compatible flags instead.
+//
+// See https://github.com/AdguardTeam/AdGuardHome/issues/3457.
+var psArgs = []string{"-A", "-o", "pid=", "-o", "comm="}
+
 // PIDByCommand searches for process named command and returns its PID ignoring
-// the PIDs from except.  If no processes found, the error returned.
-func PIDByCommand(command string, except ...int) (pid int, err error) {
-	// Don't use -C flag here since it's a feature of linux's ps
-	// implementation.  Use POSIX-compatible flags instead.
+// the PIDs from except.  If no processes found, the error returned.  l must not
+// be nil.
+func PIDByCommand(
+	ctx context.Context,
+	l *slog.Logger,
+	command string,
+	except ...int,
+) (pid int, err error) {
+	const psCmd = "ps"
+
+	l.DebugContext(ctx, "executing", "cmd", psCmd, "args", psArgs)
+
+	stdoutBuf := bytes.Buffer{}
+
+	// TODO(s.chzhen):  Catch stderr.
 	//
-	// See https://github.com/AdguardTeam/AdGuardHome/issues/3457.
-	cmd := exec.Command("ps", "-A", "-o", "pid=", "-o", "comm=")
-
-	var stdout io.ReadCloser
-	if stdout, err = cmd.StdoutPipe(); err != nil {
-		return 0, fmt.Errorf("getting the command's stdout pipe: %w", err)
-	}
-
-	if err = cmd.Start(); err != nil {
-		return 0, fmt.Errorf("start command executing: %w", err)
-	}
+	// TODO(s.chzhen):  Consider streaming the output if needed.  Using
+	// [io.Pipe] here is unnecessary; it complicates lifecycle management
+	// because the output must be read concurrently, and the PipeWriter must be
+	// explicitly closed to signal EOF.  Since this command's output is small, a
+	// bytes.Buffer via executil.Run is sufficient.
+	runErr := executil.Run(
+		ctx,
+		executil.SystemCommandConstructor{},
+		&executil.CommandConfig{
+			Path:   psCmd,
+			Args:   psArgs,
+			Stdout: &stdoutBuf,
+		},
+	)
 
 	var instNum int
-	pid, instNum, err = parsePSOutput(stdout, command, except)
+	pid, instNum, err = parsePSOutput(&stdoutBuf, command, except)
 	if err != nil {
 		return 0, err
-	}
-
-	if err = cmd.Wait(); err != nil {
-		return 0, fmt.Errorf("executing the command: %w", err)
 	}
 
 	switch instNum {
@@ -111,11 +145,15 @@ func PIDByCommand(command string, except ...int) (pid int, err error) {
 	case 1:
 		// Go on.
 	default:
-		log.Info("warning: %d %s instances found", instNum, command)
+		l.WarnContext(ctx, "instances found", "num", instNum, "command", command)
 	}
 
-	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return 0, fmt.Errorf("ps finished with code %d", code)
+	if runErr != nil {
+		if code, ok := executil.ExitCodeFromError(runErr); ok {
+			return 0, fmt.Errorf("ps finished with code %d", code)
+		}
+
+		return 0, fmt.Errorf("executing the command: %w", runErr)
 	}
 
 	return pid, nil
@@ -142,7 +180,7 @@ func parsePSOutput(r io.Reader, cmdName string, ignore []int) (largest, instNum 
 		}
 
 		instNum++
-		largest = mathutil.Max(largest, cur)
+		largest = max(largest, cur)
 	}
 	if err = s.Err(); err != nil {
 		return 0, 0, fmt.Errorf("scanning stdout: %w", err)
@@ -156,29 +194,14 @@ func IsOpenWrt() (ok bool) {
 	return isOpenWrt()
 }
 
-// RootDirFS returns the [fs.FS] rooted at the operating system's root.  On
-// Windows it returns the fs.FS rooted at the volume of the system directory
-// (usually, C:).
-func RootDirFS() (fsys fs.FS) {
-	return rootDirFS()
+// SendShutdownSignal sends the shutdown signal to the channel.
+func SendShutdownSignal(c chan<- os.Signal) {
+	sendShutdownSignal(c)
 }
 
-// NotifyReconfigureSignal notifies c on receiving reconfigure signals.
-func NotifyReconfigureSignal(c chan<- os.Signal) {
-	notifyReconfigureSignal(c)
-}
-
-// NotifyShutdownSignal notifies c on receiving shutdown signals.
-func NotifyShutdownSignal(c chan<- os.Signal) {
-	notifyShutdownSignal(c)
-}
-
-// IsReconfigureSignal returns true if sig is a reconfigure signal.
-func IsReconfigureSignal(sig os.Signal) (ok bool) {
-	return isReconfigureSignal(sig)
-}
-
-// IsShutdownSignal returns true if sig is a shutdown signal.
-func IsShutdownSignal(sig os.Signal) (ok bool) {
-	return isShutdownSignal(sig)
+// RootDir returns the root directory for the current OS.
+//
+// TODO(e.burkov):  Deprecate [osutil.RootDirFS] and move it there.
+func RootDir() (dir string) {
+	return rootDir()
 }

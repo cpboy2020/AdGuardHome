@@ -2,30 +2,31 @@ package querylog
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/stringutil"
+	"github.com/AdguardTeam/golibs/service"
 	"github.com/miekg/dns"
 )
 
-// QueryLog - main interface
+// QueryLog is the query log interface for use by other packages.
 type QueryLog interface {
-	Start()
+	// Interface starts and stops the query log.
+	service.Interface
 
-	// Close query log object
-	Close()
-
-	// Add a log entry
+	// Add adds a log entry.
 	Add(params *AddParams)
 
-	// WriteDiskConfig - write configuration
+	// WriteDiskConfig writes the query log configuration to c.
 	WriteDiskConfig(c *Config)
 
 	// ShouldLog returns true if request for the host should be logged.
@@ -36,18 +37,23 @@ type QueryLog interface {
 //
 // Do not alter any fields of this structure after using it.
 type Config struct {
-	// Ignored is the list of host names, which should not be written to log.
-	Ignored *stringutil.Set
+	// Logger is used for logging the operation of the query log.  It must not
+	// be nil.
+	Logger *slog.Logger
+
+	// Ignored contains the list of host names, which should not be written to
+	// log, and matches them.
+	Ignored *aghnet.IgnoreEngine
 
 	// Anonymizer processes the IP addresses to anonymize those if needed.
 	Anonymizer *aghnet.IPMut
 
-	// ConfigModified is called when the configuration is changed, for example
-	// by HTTP requests.
-	ConfigModified func()
+	// ConfigModifier is used to update the global configuration.  It must not
+	// be nil.
+	ConfigModifier agh.ConfigModifier
 
 	// HTTPRegister registers an HTTP handler.
-	HTTPRegister aghhttp.RegisterFunc
+	HTTPReg aghhttp.Registrar
 
 	// FindClient returns client information by their IDs.
 	FindClient func(ids []string) (c *Client, err error)
@@ -62,7 +68,7 @@ type Config struct {
 
 	// MemSize is the number of entries kept in a memory buffer before they are
 	// flushed to disk.
-	MemSize uint32
+	MemSize uint
 
 	// Enabled tells if the query log is enabled.
 	Enabled bool
@@ -142,8 +148,18 @@ func newQueryLog(conf Config) (l *queryLog, err error) {
 		}
 	}
 
+	memSize := conf.MemSize
+	if memSize == 0 {
+		// If query log is enabled, we still need to write entries to a file.
+		// And all writing goes through a buffer.
+		memSize = 1
+	}
+
 	l = &queryLog{
+		logger:     conf.Logger,
 		findClient: findClient,
+
+		buffer: container.NewRingBuffer[*logEntry](memSize),
 
 		conf:    &Config{},
 		confMu:  &sync.RWMutex{},

@@ -3,22 +3,27 @@ package hashprefix
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghtest"
 	"github.com/AdguardTeam/golibs/cache"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 )
 
 const (
 	cacheTime = 10 * time.Minute
 	cacheSize = 10000
 )
+
+// testLogger is a logger used in tests.
+var testLogger = slogutil.NewDiscardLogger()
 
 func TestChcker_getQuestion(t *testing.T) {
 	const suf = "sb.dns.adguard.com."
@@ -27,7 +32,7 @@ func TestChcker_getQuestion(t *testing.T) {
 	hashes := hostnameToHashes("1.2.3.sub.host.com")
 	assert.Len(t, hashes, 3)
 
-	hash := sha256.Sum256([]byte("3.sub.host.com"))
+	hash := hostnameHash(sha256.Sum256([]byte("3.sub.host.com")))
 	hexPref1 := hex.EncodeToString(hash[:prefixLen])
 	assert.True(t, slices.Contains(hashes, hash))
 
@@ -42,10 +47,10 @@ func TestChcker_getQuestion(t *testing.T) {
 	hash = sha256.Sum256([]byte("com"))
 	assert.False(t, slices.Contains(hashes, hash))
 
-	c := &Checker{
-		svc:       "SafeBrowsing",
-		txtSuffix: suf,
-	}
+	c := New(&Config{
+		Logger:    testLogger,
+		TXTSuffix: suf,
+	})
 
 	q := c.getQuestion(hashes)
 
@@ -78,11 +83,11 @@ func TestHostnameToHashes(t *testing.T) {
 		wantLen: 2,
 	}, {
 		name:    "private_domain_v2",
-		host:    "foo.blogspot.co.uk",
-		wantLen: 4,
+		host:    "foo.dyndns.org",
+		wantLen: 3,
 	}, {
 		name:    "sub_private_domain_v2",
-		host:    "bar.foo.blogspot.co.uk",
+		host:    "bar.foo.dyndns.org",
 		wantLen: 4,
 	}}
 
@@ -95,24 +100,27 @@ func TestHostnameToHashes(t *testing.T) {
 }
 
 func TestChecker_storeInCache(t *testing.T) {
-	c := &Checker{
-		svc:       "SafeBrowsing",
-		cacheTime: cacheTime,
-	}
+	const testTimeout = 1 * time.Second
+
+	c := New(&Config{
+		Logger:    testLogger,
+		CacheTime: cacheTime,
+	})
+
 	conf := cache.Config{}
 	c.cache = cache.New(conf)
 
 	// store in cache hashes for "3.sub.host.com" and "host.com"
 	//  and empty data for hash-prefix for "sub.host.com"
 	hashes := []hostnameHash{}
-	hash := sha256.Sum256([]byte("sub.host.com"))
+	hash := hostnameHash(sha256.Sum256([]byte("sub.host.com")))
 	hashes = append(hashes, hash)
 	var hashesArray []hostnameHash
 	hash4 := sha256.Sum256([]byte("3.sub.host.com"))
 	hashesArray = append(hashesArray, hash4)
 	hash2 := sha256.Sum256([]byte("host.com"))
 	hashesArray = append(hashesArray, hash2)
-	c.storeInCache(hashes, hashesArray)
+	c.storeInCache(testutil.ContextWithTimeout(t, testTimeout), hashes, hashesArray)
 
 	// match "3.sub.host.com" or "host.com" from cache
 	hashes = []hostnameHash{}
@@ -152,10 +160,11 @@ func TestChecker_storeInCache(t *testing.T) {
 	ok = slices.Contains(hashesToRequest, hash)
 	assert.True(t, ok)
 
-	c = &Checker{
-		svc:       "SafeBrowsing",
-		cacheTime: cacheTime,
-	}
+	c = New(&Config{
+		Logger:    testLogger,
+		CacheTime: cacheTime,
+	})
+
 	c.cache = cache.New(cache.Config{})
 
 	hashes = []hostnameHash{}
@@ -189,6 +198,7 @@ func TestChecker_Check(t *testing.T) {
 
 	for _, tc := range testCases {
 		c := New(&Config{
+			Logger:    testLogger,
 			CacheTime: cacheTime,
 			CacheSize: cacheSize,
 		})

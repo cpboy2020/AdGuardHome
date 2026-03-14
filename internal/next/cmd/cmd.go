@@ -1,5 +1,5 @@
-// Package cmd is the AdGuard Home entry point.  It contains the on-disk
-// configuration file utilities, signal processing logic, and so on.
+// Package cmd is the AdGuard Home entry point.  It assembles the configuration
+// file manager, sets up signal processing logic, and so on.
 //
 // TODO(a.garipov): Move to the upper-level internal/.
 package cmd
@@ -7,71 +7,82 @@ package cmd
 import (
 	"context"
 	"io/fs"
-	"math/rand"
 	"os"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/next/configmgr"
 	"github.com/AdguardTeam/AdGuardHome/internal/version"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/service"
 )
 
-// Main is the entry point of application.
-func Main(clientBuildFS fs.FS) {
-	// Initial Configuration
+// Main is the entry point of AdGuard Home.
+func Main(embeddedFrontend fs.FS) {
+	ctx := context.Background()
 
 	start := time.Now()
-	rand.Seed(start.UnixNano())
 
-	// TODO(a.garipov): Set up logging.
+	cmdName := os.Args[0]
+	opts, err := parseOptions(cmdName, os.Args[1:])
+	exitCode, needExit := processOptions(opts, cmdName, err)
+	if needExit {
+		os.Exit(exitCode)
+	}
 
-	log.Info("starting adguard home, version %s, pid %d", version.Version(), os.Getpid())
+	baseLogger := newBaseLogger(opts)
 
-	// Web Service
-
-	// TODO(a.garipov): Use in the Web service.
-	_ = clientBuildFS
-
-	// TODO(a.garipov): Set up configuration file name.
-	const confFile = "AdGuardHome.1.yaml"
-
-	confMgr, err := configmgr.New(confFile, start)
-	fatalOnError(err)
-
-	web := confMgr.Web()
-	err = web.Start()
-	fatalOnError(err)
-
-	dns := confMgr.DNS()
-	err = dns.Start()
-	fatalOnError(err)
-
-	sigHdlr := newSignalHandler(
-		confFile,
-		start,
-		web,
-		dns,
+	baseLogger.InfoContext(
+		ctx,
+		"starting adguard home",
+		"version", version.Version(),
+		"pid", os.Getpid(),
 	)
 
-	go sigHdlr.handle()
+	if opts.workDir != "" {
+		baseLogger.InfoContext(ctx, "changing working directory", "dir", opts.workDir)
 
-	select {}
-}
-
-// defaultTimeout is the timeout used for some operations where another timeout
-// hasn't been defined yet.
-const defaultTimeout = 15 * time.Second
-
-// ctxWithDefaultTimeout is a helper function that returns a context with
-// timeout set to defaultTimeout.
-func ctxWithDefaultTimeout() (ctx context.Context, cancel context.CancelFunc) {
-	return context.WithTimeout(context.Background(), defaultTimeout)
-}
-
-// fatalOnError is a helper that exits the program with an error code if err is
-// not nil.  It must only be used within Main.
-func fatalOnError(err error) {
-	if err != nil {
-		log.Fatal(err)
+		err = os.Chdir(opts.workDir)
+		errors.Check(err)
 	}
+
+	frontend, err := frontendFromOpts(ctx, baseLogger, opts, embeddedFrontend)
+	errors.Check(err)
+
+	startCtx, startCancel := context.WithTimeout(ctx, defaultTimeoutStart)
+	defer startCancel()
+
+	confMgrConf := &configmgr.Config{
+		BaseLogger: baseLogger,
+		Logger:     baseLogger.With(slogutil.KeyPrefix, "configmgr"),
+		Frontend:   frontend,
+		WebAddr:    opts.webAddr,
+		Start:      start,
+		FileName:   opts.confFile,
+	}
+
+	svc, err := newServiceMgr(ctx, &serviceMgrConfig{
+		confMgrConf: confMgrConf,
+		logger:      baseLogger.With(slogutil.KeyPrefix, "svc"),
+		pidFilePath: opts.pidFile,
+	})
+	errors.Check(err)
+
+	errors.Check(svc.Start(startCtx))
+
+	sigHdlr := service.NewSignalHandler(&service.SignalHandlerConfig{
+		Logger: baseLogger.With(slogutil.KeyPrefix, service.SignalHandlerPrefix),
+	})
+
+	sigHdlr.AddService(svc)
+	sigHdlr.AddRefresher(svc)
+
+	os.Exit(sigHdlr.Handle(ctx))
 }
+
+// Default timeouts.
+//
+// TODO(a.garipov):  Make configurable.
+const (
+	defaultTimeoutStart = 1 * time.Minute
+)

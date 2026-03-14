@@ -1,13 +1,13 @@
 package safesearch
 
 import (
-	"context"
-	"net"
+	"net/netip"
 	"testing"
 	"time"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/aghtest"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/AdguardTeam/urlfilter/rules"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
@@ -23,20 +23,29 @@ const (
 	testCacheTTL  = 30 * time.Minute
 )
 
+// testTimeout is the common timeout for tests and contexts.
+const testTimeout = 1 * time.Second
+
 var defaultSafeSearchConf = filtering.SafeSearchConfig{
 	Enabled:    true,
 	Bing:       true,
 	DuckDuckGo: true,
+	Ecosia:     true,
 	Google:     true,
 	Pixabay:    true,
 	Yandex:     true,
 	YouTube:    true,
 }
 
-var yandexIP = net.IPv4(213, 180, 193, 56)
+var yandexIP = netip.AddrFrom4([4]byte{213, 180, 193, 56})
 
 func newForTest(t testing.TB, ssConf filtering.SafeSearchConfig) (ss *Default) {
-	ss, err := NewDefault(ssConf, "", testCacheSize, testCacheTTL)
+	ss, err := NewDefault(testutil.ContextWithTimeout(t, testTimeout), &DefaultConfig{
+		Logger:         slogutil.NewDiscardLogger(),
+		ServicesConfig: ssConf,
+		CacheSize:      testCacheSize,
+		CacheTTL:       testCacheTTL,
+	})
 	require.NoError(t, err)
 
 	return ss
@@ -53,16 +62,17 @@ func TestSafeSearchCacheYandex(t *testing.T) {
 	const domain = "yandex.ru"
 
 	ss := newForTest(t, filtering.SafeSearchConfig{Enabled: false})
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
 
 	// Check host with disabled safesearch.
-	res, err := ss.CheckHost(domain, testQType)
+	res, err := ss.CheckHost(ctx, domain, testQType)
 	require.NoError(t, err)
 
 	assert.False(t, res.IsFiltered)
 	assert.Empty(t, res.Rules)
 
 	ss = newForTest(t, defaultSafeSearchConf)
-	res, err = ss.CheckHost(domain, testQType)
+	res, err = ss.CheckHost(ctx, domain, testQType)
 	require.NoError(t, err)
 
 	// For yandex we already know valid IP.
@@ -71,67 +81,32 @@ func TestSafeSearchCacheYandex(t *testing.T) {
 	assert.Equal(t, res.Rules[0].IP, yandexIP)
 
 	// Check cache.
-	cachedValue, isFound := ss.getCachedResult(domain, testQType)
+	cachedValue, isFound := ss.getCachedResult(ctx, domain, testQType)
 	require.True(t, isFound)
 	require.Len(t, cachedValue.Rules, 1)
 
 	assert.Equal(t, cachedValue.Rules[0].IP, yandexIP)
 }
 
-func TestSafeSearchCacheGoogle(t *testing.T) {
-	const domain = "www.google.ru"
+func BenchmarkDefault_SearchHost(b *testing.B) {
+	const googleHost = "www.google.com"
 
-	ss := newForTest(t, filtering.SafeSearchConfig{Enabled: false})
-
-	res, err := ss.CheckHost(domain, testQType)
-	require.NoError(t, err)
-
-	assert.False(t, res.IsFiltered)
-	assert.Empty(t, res.Rules)
-
-	resolver := &aghtest.TestResolver{}
-	ss = newForTest(t, defaultSafeSearchConf)
-	ss.resolver = resolver
-
-	// Lookup for safesearch domain.
-	rewrite := ss.searchHost(domain, testQType)
-
-	ips, err := resolver.LookupIP(context.Background(), "ip", rewrite.NewCNAME)
-	require.NoError(t, err)
-
-	var foundIP net.IP
-	for _, ip := range ips {
-		if ip.To4() != nil {
-			foundIP = ip
-
-			break
-		}
-	}
-
-	res, err = ss.CheckHost(domain, testQType)
-	require.NoError(t, err)
-	require.Len(t, res.Rules, 1)
-
-	assert.True(t, res.Rules[0].IP.Equal(foundIP))
-
-	// Check cache.
-	cachedValue, isFound := ss.getCachedResult(domain, testQType)
-	require.True(t, isFound)
-	require.Len(t, cachedValue.Rules, 1)
-
-	assert.True(t, cachedValue.Rules[0].IP.Equal(foundIP))
-}
-
-const googleHost = "www.google.com"
-
-var dnsRewriteSink *rules.DNSRewrite
-
-func BenchmarkSafeSearch(b *testing.B) {
 	ss := newForTest(b, defaultSafeSearchConf)
 
-	for n := 0; n < b.N; n++ {
-		dnsRewriteSink = ss.searchHost(googleHost, testQType)
+	var rewrite *rules.DNSRewrite
+	b.ReportAllocs()
+	for b.Loop() {
+		rewrite = ss.searchHost(googleHost, testQType)
 	}
 
-	assert.Equal(b, "forcesafesearch.google.com", dnsRewriteSink.NewCNAME)
+	require.NotNil(b, rewrite)
+	assert.Equal(b, "forcesafesearch.google.com", rewrite.NewCNAME)
+
+	// Most recent results:
+	//
+	//	goos: darwin
+	//	goarch: amd64
+	//	pkg: github.com/AdguardTeam/AdGuardHome/internal/filtering/safesearch
+	//	cpu: Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz
+	//	BenchmarkDefault_SearchHost-12    	  751882	      1604 ns/op	     129 B/op	       5 allocs/op
 }

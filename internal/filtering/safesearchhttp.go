@@ -12,8 +12,8 @@ import (
 //
 // Deprecated: Use handleSafeSearchSettings.
 func (d *DNSFilter) handleSafeSearchEnable(w http.ResponseWriter, r *http.Request) {
-	setProtectedBool(&d.confLock, &d.Config.SafeSearchConf.Enabled, true)
-	d.Config.ConfigModified()
+	setProtectedBool(d.confMu, &d.conf.SafeSearchConf.Enabled, true)
+	d.conf.ConfModifier.Apply(r.Context())
 }
 
 // handleSafeSearchDisable is the handler for POST /control/safesearch/disable
@@ -21,8 +21,8 @@ func (d *DNSFilter) handleSafeSearchEnable(w http.ResponseWriter, r *http.Reques
 //
 // Deprecated: Use handleSafeSearchSettings.
 func (d *DNSFilter) handleSafeSearchDisable(w http.ResponseWriter, r *http.Request) {
-	setProtectedBool(&d.confLock, &d.Config.SafeSearchConf.Enabled, false)
-	d.Config.ConfigModified()
+	setProtectedBool(d.confMu, &d.conf.SafeSearchConf.Enabled, false)
+	d.conf.ConfModifier.Apply(r.Context())
 }
 
 // handleSafeSearchStatus is the handler for GET /control/safesearch/status
@@ -30,42 +30,45 @@ func (d *DNSFilter) handleSafeSearchDisable(w http.ResponseWriter, r *http.Reque
 func (d *DNSFilter) handleSafeSearchStatus(w http.ResponseWriter, r *http.Request) {
 	var resp SafeSearchConfig
 	func() {
-		d.confLock.RLock()
-		defer d.confLock.RUnlock()
+		d.confMu.RLock()
+		defer d.confMu.RUnlock()
 
-		resp = d.Config.SafeSearchConf
+		resp = d.conf.SafeSearchConf
 	}()
 
-	_ = aghhttp.WriteJSONResponse(w, r, resp)
+	aghhttp.WriteJSONResponseOK(r.Context(), d.logger, w, r, resp)
 }
 
 // handleSafeSearchSettings is the handler for PUT /control/safesearch/settings
 // HTTP API.
 func (d *DNSFilter) handleSafeSearchSettings(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := d.logger
+
 	req := &SafeSearchConfig{}
 	err := json.NewDecoder(r.Body).Decode(req)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "reading req: %s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "reading req: %s", err)
 
 		return
 	}
 
 	conf := *req
-	err = d.safeSearch.Update(conf)
+	err = d.safeSearch.Update(ctx, conf)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "updating: %s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "updating: %s", err)
 
 		return
 	}
 
 	func() {
-		d.confLock.Lock()
-		defer d.confLock.Unlock()
+		d.confMu.Lock()
+		defer d.confMu.Unlock()
 
-		d.Config.SafeSearchConf = conf
+		d.conf.SafeSearchConf = conf
 	}()
 
-	d.Config.ConfigModified()
+	d.conf.ConfModifier.Apply(ctx)
 
-	aghhttp.OK(w)
+	aghhttp.OK(ctx, l, w)
 }

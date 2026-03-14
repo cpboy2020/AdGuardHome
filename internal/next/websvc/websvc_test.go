@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -14,14 +15,14 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/next/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/next/dnssvc"
 	"github.com/AdguardTeam/AdGuardHome/internal/next/websvc"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/netutil/httputil"
+	"github.com/AdguardTeam/golibs/netutil/urlutil"
 	"github.com/AdguardTeam/golibs/testutil"
+	"github.com/AdguardTeam/golibs/testutil/fakeio/fakefs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestMain(m *testing.M) {
-	testutil.DiscardLogOutput(m)
-}
 
 // testTimeout is the common timeout for tests.
 const testTimeout = 1 * time.Second
@@ -64,13 +65,17 @@ func (m *configManager) UpdateWeb(ctx context.Context, c *websvc.Config) (err er
 // newConfigManager returns a *configManager all methods of which panic.
 func newConfigManager() (m *configManager) {
 	return &configManager{
-		onDNS: func() (svc agh.ServiceWithConfig[*dnssvc.Config]) { panic("not implemented") },
-		onWeb: func() (svc agh.ServiceWithConfig[*websvc.Config]) { panic("not implemented") },
-		onUpdateDNS: func(_ context.Context, _ *dnssvc.Config) (err error) {
-			panic("not implemented")
+		onDNS: func() (_ agh.ServiceWithConfig[*dnssvc.Config]) {
+			panic(testutil.UnexpectedCall())
 		},
-		onUpdateWeb: func(_ context.Context, _ *websvc.Config) (err error) {
-			panic("not implemented")
+		onWeb: func() (_ agh.ServiceWithConfig[*websvc.Config]) {
+			panic(testutil.UnexpectedCall())
+		},
+		onUpdateDNS: func(ctx context.Context, c *dnssvc.Config) (_ error) {
+			panic(testutil.UnexpectedCall(ctx, c))
+		},
+		onUpdateWeb: func(ctx context.Context, c *websvc.Config) (_ error) {
+			panic(testutil.UnexpectedCall(ctx, c))
 		},
 	}
 }
@@ -78,16 +83,21 @@ func newConfigManager() (m *configManager) {
 // newTestServer creates and starts a new web service instance as well as its
 // sole address.  It also registers a cleanup procedure, which shuts the
 // instance down.
-//
-// TODO(a.garipov): Use svc or remove it.
 func newTestServer(
-	t testing.TB,
+	tb testing.TB,
 	confMgr websvc.ConfigManager,
 ) (svc *websvc.Service, addr netip.AddrPort) {
-	t.Helper()
+	tb.Helper()
 
 	c := &websvc.Config{
-		ConfigManager:   confMgr,
+		Logger: slogutil.NewDiscardLogger(),
+		Pprof: &websvc.PprofConfig{
+			Enabled: false,
+		},
+		ConfigManager: confMgr,
+		Frontend: &fakefs.FS{
+			OnOpen: func(_ string) (_ fs.File, _ error) { return nil, fs.ErrNotExist },
+		},
 		TLS:             nil,
 		Addresses:       []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:0")},
 		SecureAddresses: nil,
@@ -96,21 +106,18 @@ func newTestServer(
 		ForceHTTPS:      false,
 	}
 
-	svc = websvc.New(c)
+	svc, err := websvc.New(c)
+	require.NoError(tb, err)
 
-	err := svc.Start()
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-		t.Cleanup(cancel)
-
-		err = svc.Shutdown(ctx)
-		require.NoError(t, err)
+	err = svc.Start(testutil.ContextWithTimeout(tb, testTimeout))
+	require.NoError(tb, err)
+	testutil.CleanupAndRequireSuccess(tb, func() (err error) {
+		return svc.Shutdown(testutil.ContextWithTimeout(tb, testTimeout))
 	})
 
 	c = svc.Config()
-	require.NotNil(t, c)
-	require.Len(t, c.Addresses, 1)
+	require.NotNil(tb, c)
+	require.Len(tb, c.Addresses, 1)
 
 	return svc, c.Addresses[0]
 }
@@ -122,23 +129,23 @@ type jobj map[string]any
 // the response as well as checks that the status code is correct.
 //
 // TODO(a.garipov): Add helpers for other methods.
-func httpGet(t testing.TB, u *url.URL, wantCode int) (body []byte) {
-	t.Helper()
+func httpGet(tb testing.TB, u *url.URL, wantCode int) (body []byte) {
+	tb.Helper()
 
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
-	require.NoErrorf(t, err, "creating req")
+	require.NoErrorf(tb, err, "creating req")
 
 	httpCli := &http.Client{
 		Timeout: testTimeout,
 	}
 	resp, err := httpCli.Do(req)
-	require.NoErrorf(t, err, "performing req")
-	require.Equal(t, wantCode, resp.StatusCode)
+	require.NoErrorf(tb, err, "performing req")
+	require.Equal(tb, wantCode, resp.StatusCode)
 
-	testutil.CleanupAndRequireSuccess(t, resp.Body.Close)
+	testutil.CleanupAndRequireSuccess(tb, resp.Body.Close)
 
 	body, err = io.ReadAll(resp.Body)
-	require.NoErrorf(t, err, "reading body")
+	require.NoErrorf(tb, err, "reading body")
 
 	return body
 }
@@ -148,26 +155,26 @@ func httpGet(t testing.TB, u *url.URL, wantCode int) (body []byte) {
 // checks that the status code is correct.
 //
 // TODO(a.garipov): Add helpers for other methods.
-func httpPatch(t testing.TB, u *url.URL, reqBody any, wantCode int) (body []byte) {
-	t.Helper()
+func httpPatch(tb testing.TB, u *url.URL, reqBody any, wantCode int) (body []byte) {
+	tb.Helper()
 
 	b, err := json.Marshal(reqBody)
-	require.NoErrorf(t, err, "marshaling reqBody")
+	require.NoErrorf(tb, err, "marshaling reqBody")
 
 	req, err := http.NewRequest(http.MethodPatch, u.String(), bytes.NewReader(b))
-	require.NoErrorf(t, err, "creating req")
+	require.NoErrorf(tb, err, "creating req")
 
 	httpCli := &http.Client{
 		Timeout: testTimeout,
 	}
 	resp, err := httpCli.Do(req)
-	require.NoErrorf(t, err, "performing req")
-	require.Equal(t, wantCode, resp.StatusCode)
+	require.NoErrorf(tb, err, "performing req")
+	require.Equal(tb, wantCode, resp.StatusCode)
 
-	testutil.CleanupAndRequireSuccess(t, resp.Body.Close)
+	testutil.CleanupAndRequireSuccess(tb, resp.Body.Close)
 
 	body, err = io.ReadAll(resp.Body)
-	require.NoErrorf(t, err, "reading body")
+	require.NoErrorf(tb, err, "reading body")
 
 	return body
 }
@@ -176,12 +183,12 @@ func TestService_Start_getHealthCheck(t *testing.T) {
 	confMgr := newConfigManager()
 	_, addr := newTestServer(t, confMgr)
 	u := &url.URL{
-		Scheme: "http",
+		Scheme: urlutil.SchemeHTTP,
 		Host:   addr.String(),
-		Path:   websvc.PathHealthCheck,
+		Path:   websvc.PathPatternHealthCheck,
 	}
 
 	body := httpGet(t, u, http.StatusOK)
 
-	assert.Equal(t, []byte("OK"), body)
+	assert.Equal(t, []byte(httputil.HealthCheckHandler), body)
 }

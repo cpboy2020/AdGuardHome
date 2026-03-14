@@ -1,7 +1,6 @@
 package websvc_test
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/netip"
@@ -9,9 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/next/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/next/dnssvc"
 	"github.com/AdguardTeam/AdGuardHome/internal/next/websvc"
+	"github.com/AdguardTeam/dnsproxy/proxy"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/netutil/urlutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -20,49 +23,52 @@ func TestService_HandleGetSettingsAll(t *testing.T) {
 	// TODO(a.garipov): Add all currently supported parameters.
 
 	wantDNS := &websvc.HTTPAPIDNSSettings{
-		Addresses:        []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:53")},
-		BootstrapServers: []string{"94.140.14.140", "94.140.14.141"},
-		UpstreamServers:  []string{"94.140.14.14", "1.1.1.1"},
-		UpstreamTimeout:  websvc.JSONDuration(1 * time.Second),
-	}
-
-	wantWeb := &websvc.HTTPAPIHTTPSettings{
-		Addresses:       []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:80")},
-		SecureAddresses: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:443")},
-		Timeout:         websvc.JSONDuration(5 * time.Second),
-		ForceHTTPS:      true,
+		UpstreamMode:        proxy.UpstreamModeParallel,
+		Addresses:           []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:53")},
+		BootstrapServers:    []string{"94.140.14.140", "94.140.14.141"},
+		UpstreamServers:     []string{"94.140.14.14", "1.1.1.1"},
+		UpstreamTimeout:     aghhttp.JSONDuration(1 * time.Second),
+		CacheSize:           1048576,
+		BootstrapPreferIPv6: true,
+		RefuseAny:           true,
+		UseDNS64:            true,
 	}
 
 	confMgr := newConfigManager()
 	confMgr.onDNS = func() (s agh.ServiceWithConfig[*dnssvc.Config]) {
 		c, err := dnssvc.New(&dnssvc.Config{
-			Addresses:        wantDNS.Addresses,
-			UpstreamServers:  wantDNS.UpstreamServers,
-			BootstrapServers: wantDNS.BootstrapServers,
-			UpstreamTimeout:  time.Duration(wantDNS.UpstreamTimeout),
+			Logger:              slogutil.NewDiscardLogger(),
+			UpstreamMode:        proxy.UpstreamModeParallel,
+			Addresses:           wantDNS.Addresses,
+			UpstreamServers:     wantDNS.UpstreamServers,
+			BootstrapServers:    wantDNS.BootstrapServers,
+			UpstreamTimeout:     time.Duration(wantDNS.UpstreamTimeout),
+			CacheSize:           1048576,
+			BootstrapPreferIPv6: true,
+			RefuseAny:           true,
+			UseDNS64:            true,
 		})
 		require.NoError(t, err)
 
 		return c
 	}
 
-	confMgr.onWeb = func() (s agh.ServiceWithConfig[*websvc.Config]) {
-		return websvc.New(&websvc.Config{
-			TLS: &tls.Config{
-				Certificates: []tls.Certificate{{}},
-			},
-			Addresses:       wantWeb.Addresses,
-			SecureAddresses: wantWeb.SecureAddresses,
-			Timeout:         time.Duration(wantWeb.Timeout),
-			ForceHTTPS:      true,
-		})
+	svc, addr := newTestServer(t, confMgr)
+	u := &url.URL{
+		Scheme: urlutil.SchemeHTTP,
+		Host:   addr.String(),
+		Path:   websvc.PathPatternV1SettingsAll,
 	}
 
-	_, addr := newTestServer(t, confMgr)
-	u := &url.URL{
-		Scheme: "http",
-		Host:   addr.String(),
-		Path:   websvc.PathV1SettingsAll,
+	confMgr.onWeb = func() (s agh.ServiceWithConfig[*websvc.Config]) {
+		return svc
+	}
+
+	wantWeb := &websvc.HTTPAPIHTTPSettings{
+		Addresses:       []netip.AddrPort{addr},
+		SecureAddresses: nil,
+		Timeout:         aghhttp.JSONDuration(testTimeout),
+		ForceHTTPS:      false,
 	}
 
 	body := httpGet(t, u, http.StatusOK)

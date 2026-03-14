@@ -5,41 +5,52 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"io"
-	"mime/multipart"
-	"net/http"
-	"net/textproto"
-	"net/url"
+	"log/slog"
+	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
-	"github.com/AdguardTeam/AdGuardHome/internal/aghio"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/httphdr"
-	"github.com/AdguardTeam/golibs/log"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/osutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
+	"github.com/c2h5oh/datasize"
 )
 
+// TODO(e.burkov):  Remove the default as they should be set by configuration.
 const (
-	twoskyConfFile   = "./.twosky.json"
-	localesDir       = "./client/src/__locales"
-	defaultBaseFile  = "en.json"
-	defaultProjectID = "home"
-	srcDir           = "./client/src"
-	twoskyURI        = "https://twosky.int.agrd.dev/api/v1"
+	twoskyConfFile  = "./.twosky.json"
+	localesDirHome  = "./client/src/__locales"
+	defaultBaseFile = "en.json"
+	srcDir          = "./client/src"
+	twoskyURI       = "https://twosky.int.agrd.dev/api/v1"
 
-	readLimit = 1 * 1024 * 1024
+	readLimit     = 1 * datasize.MB
+	uploadTimeout = 20 * time.Second
 )
+
+// blockerLangCodes is the codes of languages which need to be fully translated.
+var blockerLangCodes = []langCode{
+	"de",
+	"en",
+	"es",
+	"fr",
+	"it",
+	"ja",
+	"ko",
+	"pt-br",
+	"pt-pt",
+	"ru",
+	"zh-cn",
+	"zh-tw",
+}
 
 // langCode is a language code.
 type langCode string
@@ -54,6 +65,9 @@ type textLabel string
 type locales map[textLabel]string
 
 func main() {
+	ctx := context.Background()
+	l := slogutil.New(nil)
+
 	if len(os.Args) == 1 {
 		usage("need a command")
 	}
@@ -62,44 +76,29 @@ func main() {
 		usage("")
 	}
 
-	uriStr := os.Getenv("TWOSKY_URI")
-	if uriStr == "" {
-		uriStr = twoskyURI
-	}
+	homeConf, servicesConf, err := readTwoskyConfig()
+	errors.Check(err)
 
-	uri, err := url.Parse(uriStr)
-	check(err)
-
-	projectID := os.Getenv("TWOSKY_PROJECT_ID")
-	if projectID == "" {
-		projectID = defaultProjectID
-	}
-
-	conf, err := readTwoskyConf()
-	check(err)
+	var cli *twoskyClient
 
 	switch os.Args[1] {
 	case "summary":
-		err = summary(conf.Languages)
+		errors.Check(summary(homeConf.Languages))
 	case "download":
-		err = download(uri, projectID, conf.Languages)
+		cli = errors.Must(newTwoskyClient(homeConf))
+		cli.download(ctx, l)
+
+		cli = errors.Must(newTwoskyClient(servicesConf))
+		cli.download(ctx, l)
 	case "unused":
-		err = unused(conf.LocalizableFiles[0])
+		errors.Check(unused(ctx, l, homeConf.LocalizableFiles[0]))
 	case "upload":
-		err = upload(uri, projectID, conf.BaseLangcode)
+		cli = errors.Must(newTwoskyClient(homeConf))
+		errors.Check(cli.upload())
 	case "auto-add":
-		err = autoAdd(conf.LocalizableFiles[0])
+		errors.Check(autoAdd(ctx, l, homeConf.LocalizableFiles[0]))
 	default:
 		usage("unknown command")
-	}
-
-	check(err)
-}
-
-// check is a simple error-checking helper for scripts.
-func check(err error) {
-	if err != nil {
-		panic(err)
 	}
 }
 
@@ -125,59 +124,31 @@ Commands:
 	if addStr != "" {
 		fmt.Printf("%s\n%s\n", addStr, usageStr)
 
-		os.Exit(1)
+		os.Exit(osutil.ExitCodeFailure)
 	}
 
 	fmt.Println(usageStr)
 
-	os.Exit(0)
+	os.Exit(osutil.ExitCodeSuccess)
 }
 
-// twoskyConf is the configuration structure for localization.
-type twoskyConf struct {
-	Languages        languages `json:"languages"`
-	ProjectID        string    `json:"project_id"`
-	BaseLangcode     langCode  `json:"base_locale"`
-	LocalizableFiles []string  `json:"localizable_files"`
-}
+// validateLanguageStr validates languages codes that contain in the str and
+// returns them or error.
+func validateLanguageStr(str string, all languages) (langs []langCode, err error) {
+	codes := strings.Fields(str)
+	langs = make([]langCode, 0, len(codes))
 
-// readTwoskyConf returns configuration.
-func readTwoskyConf() (t twoskyConf, err error) {
-	defer func() { err = errors.Annotate(err, "parsing twosky conf: %w") }()
-
-	b, err := os.ReadFile(twoskyConfFile)
-	if err != nil {
-		// Don't wrap the error since it's informative enough as is.
-		return twoskyConf{}, err
-	}
-
-	var tsc []twoskyConf
-	err = json.Unmarshal(b, &tsc)
-	if err != nil {
-		err = fmt.Errorf("unmarshalling %q: %w", twoskyConfFile, err)
-
-		return twoskyConf{}, err
-	}
-
-	if len(tsc) == 0 {
-		err = fmt.Errorf("%q is empty", twoskyConfFile)
-
-		return twoskyConf{}, err
-	}
-
-	conf := tsc[0]
-
-	for _, lang := range conf.Languages {
-		if lang == "" {
-			return twoskyConf{}, errors.Error("language is empty")
+	for _, k := range codes {
+		lc := langCode(k)
+		_, ok := all[lc]
+		if !ok {
+			return nil, fmt.Errorf("validating languages: unexpected language code %q", k)
 		}
+
+		langs = append(langs, lc)
 	}
 
-	if len(conf.LocalizableFiles) == 0 {
-		return twoskyConf{}, errors.Error("no localizable files specified")
-	}
-
-	return conf, nil
+	return langs, nil
 }
 
 // readLocales reads file with name fn and returns a map, where key is text
@@ -201,8 +172,11 @@ func readLocales(fn string) (loc locales, err error) {
 }
 
 // summary prints summary for translations.
+//
+// TODO(e.burkov):  Consider making it a method of [twoskyClient] and
+// calculating summary for all configurations.
 func summary(langs languages) (err error) {
-	basePath := filepath.Join(localesDir, defaultBaseFile)
+	basePath := filepath.Join(localesDirHome, defaultBaseFile)
 	baseLoc, err := readLocales(basePath)
 	if err != nil {
 		return fmt.Errorf("summary: %w", err)
@@ -210,11 +184,8 @@ func summary(langs languages) (err error) {
 
 	size := float64(len(baseLoc))
 
-	keys := maps.Keys(langs)
-	slices.Sort(keys)
-
-	for _, lang := range keys {
-		name := filepath.Join(localesDir, string(lang)+".json")
+	for _, lang := range slices.Sorted(maps.Keys(langs)) {
+		name := filepath.Join(localesDirHome, string(lang)+".json")
 		if name == basePath {
 			continue
 		}
@@ -227,152 +198,47 @@ func summary(langs languages) (err error) {
 
 		f := float64(len(loc)) * 100 / size
 
-		fmt.Printf("%s\t %6.2f %%\n", lang, f)
+		blocker := ""
+
+		// N is small enough to not raise performance questions.
+		ok := slices.Contains(blockerLangCodes, lang)
+		if ok {
+			blocker = " (blocker)"
+		}
+
+		fmt.Printf("%s\t %6.2f %%%s\n", lang, f, blocker)
 	}
 
 	return nil
-}
-
-// download and save all translations.  uri is the base URL.  projectID is the
-// name of the project.
-func download(uri *url.URL, projectID string, langs languages) (err error) {
-	var numWorker int
-
-	flagSet := flag.NewFlagSet("download", flag.ExitOnError)
-	flagSet.Usage = func() {
-		usage("download command error")
-	}
-	flagSet.IntVar(&numWorker, "n", 1, "number of concurrent downloads")
-
-	err = flagSet.Parse(os.Args[2:])
-	if err != nil {
-		// Don't wrap the error since it's informative enough as is.
-		return err
-	}
-
-	if numWorker < 1 {
-		usage("count must be positive")
-	}
-
-	downloadURI := uri.JoinPath("download")
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	wg := &sync.WaitGroup{}
-	uriCh := make(chan *url.URL, len(langs))
-
-	for i := 0; i < numWorker; i++ {
-		wg.Add(1)
-		go downloadWorker(wg, client, uriCh)
-	}
-
-	for lang := range langs {
-		uri = translationURL(downloadURI, defaultBaseFile, projectID, lang)
-
-		uriCh <- uri
-	}
-
-	close(uriCh)
-	wg.Wait()
-
-	return nil
-}
-
-// downloadWorker downloads translations by received urls and saves them.
-func downloadWorker(wg *sync.WaitGroup, client *http.Client, uriCh <-chan *url.URL) {
-	defer wg.Done()
-
-	for uri := range uriCh {
-		data, err := getTranslation(client, uri.String())
-		if err != nil {
-			log.Error("download worker: getting translation: %s", err)
-
-			continue
-		}
-
-		q := uri.Query()
-		code := q.Get("language")
-
-		name := filepath.Join(localesDir, code+".json")
-		err = os.WriteFile(name, data, 0o664)
-		if err != nil {
-			log.Error("download worker: writing file: %s", err)
-
-			continue
-		}
-
-		fmt.Println(name)
-	}
-}
-
-// getTranslation returns received translation data or error.
-func getTranslation(client *http.Client, url string) (data []byte, err error) {
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("requesting: %w", err)
-	}
-
-	defer log.OnCloserError(resp.Body, log.ERROR)
-
-	if resp.StatusCode != http.StatusOK {
-		err = fmt.Errorf("url: %q; status code: %s", url, http.StatusText(resp.StatusCode))
-
-		return nil, err
-	}
-
-	limitReader, err := aghio.LimitReader(resp.Body, readLimit)
-	if err != nil {
-		err = fmt.Errorf("limit reading: %w", err)
-
-		return nil, err
-	}
-
-	data, err = io.ReadAll(limitReader)
-	if err != nil {
-		err = fmt.Errorf("reading all: %w", err)
-
-		return nil, err
-	}
-
-	return data, nil
-}
-
-// translationURL returns a new url.URL with provided query parameters.
-func translationURL(oldURL *url.URL, baseFile, projectID string, lang langCode) (uri *url.URL) {
-	uri = &url.URL{}
-	*uri = *oldURL
-
-	q := uri.Query()
-	q.Set("format", "json")
-	q.Set("filename", baseFile)
-	q.Set("project", projectID)
-	q.Set("language", string(lang))
-
-	uri.RawQuery = q.Encode()
-
-	return uri
 }
 
 // unused prints unused text labels.
-func unused(basePath string) (err error) {
+//
+// TODO(e.burkov):  Consider making it a method of [twoskyClient] and searching
+// unused strings for all configurations.
+func unused(ctx context.Context, l *slog.Logger, basePath string) (err error) {
+	defer func() { err = errors.Annotate(err, "unused: %w") }()
+
 	baseLoc, err := readLocales(basePath)
 	if err != nil {
-		return fmt.Errorf("unused: %w", err)
+		return err
 	}
 
-	locDir := filepath.Clean(localesDir)
+	locDir := filepath.Clean(localesDirHome)
+	js, err := findJS(ctx, l, locDir)
+	if err != nil {
+		return err
+	}
 
-	fileNames := []string{}
-	err = filepath.Walk(srcDir, func(name string, info os.FileInfo, err error) error {
+	return findUnused(js, baseLoc)
+}
+
+// findJS returns list of JavaScript and JSON files or error.
+func findJS(ctx context.Context, l *slog.Logger, locDir string) (fileNames []string, err error) {
+	walkFn := func(name string, _ os.FileInfo, err error) error {
 		if err != nil {
-			log.Info("warning: accessing a path %q: %s", name, err)
+			l.WarnContext(ctx, "accessing a path", slogutil.KeyError, err)
 
-			return nil
-		}
-
-		if info.IsDir() {
 			return nil
 		}
 
@@ -386,13 +252,14 @@ func unused(basePath string) (err error) {
 		}
 
 		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("filepath walking %q: %w", srcDir, err)
 	}
 
-	return findUnused(fileNames, baseLoc)
+	err = filepath.Walk(srcDir, walkFn)
+	if err != nil {
+		return nil, fmt.Errorf("filepath walking %q: %w", srcDir, err)
+	}
+
+	return fileNames, nil
 }
 
 // findUnused prints unused text labels from fileNames.
@@ -421,123 +288,8 @@ func findUnused(fileNames []string, loc locales) (err error) {
 		}
 	}
 
-	keys := maps.Keys(loc)
-	slices.Sort(keys)
-
-	for _, v := range keys {
+	for _, v := range slices.Sorted(maps.Keys(loc)) {
 		fmt.Println(v)
-	}
-
-	return nil
-}
-
-// upload base translation.  uri is the base URL.  projectID is the name of the
-// project.  baseLang is the base language code.
-func upload(uri *url.URL, projectID string, baseLang langCode) (err error) {
-	defer func() { err = errors.Annotate(err, "upload: %w") }()
-
-	uploadURI := uri.JoinPath("upload")
-
-	lang := baseLang
-
-	langStr := os.Getenv("UPLOAD_LANGUAGE")
-	if langStr != "" {
-		lang = langCode(langStr)
-	}
-
-	basePath := filepath.Join(localesDir, defaultBaseFile)
-
-	formData := map[string]string{
-		"format":   "json",
-		"language": string(lang),
-		"filename": defaultBaseFile,
-		"project":  projectID,
-	}
-
-	buf, cType, err := prepareMultipartMsg(formData, basePath)
-	if err != nil {
-		return fmt.Errorf("preparing multipart msg: %w", err)
-	}
-
-	err = send(uploadURI.String(), cType, buf)
-	if err != nil {
-		return fmt.Errorf("sending multipart msg: %w", err)
-	}
-
-	return nil
-}
-
-// prepareMultipartMsg prepares translation data for upload.
-func prepareMultipartMsg(
-	formData map[string]string,
-	basePath string,
-) (buf *bytes.Buffer, cType string, err error) {
-	buf = &bytes.Buffer{}
-	w := multipart.NewWriter(buf)
-	var fw io.Writer
-
-	for k, v := range formData {
-		err = w.WriteField(k, v)
-		if err != nil {
-			return nil, "", fmt.Errorf("writing field: %w", err)
-		}
-	}
-
-	file, err := os.Open(basePath)
-	if err != nil {
-		return nil, "", fmt.Errorf("opening file: %w", err)
-	}
-
-	defer func() {
-		err = errors.WithDeferred(err, file.Close())
-	}()
-
-	h := make(textproto.MIMEHeader)
-	h.Set(httphdr.ContentType, aghhttp.HdrValApplicationJSON)
-
-	d := fmt.Sprintf("form-data; name=%q; filename=%q", "file", defaultBaseFile)
-	h.Set(httphdr.ContentDisposition, d)
-
-	fw, err = w.CreatePart(h)
-	if err != nil {
-		return nil, "", fmt.Errorf("creating part: %w", err)
-	}
-
-	_, err = io.Copy(fw, file)
-	if err != nil {
-		return nil, "", fmt.Errorf("copying: %w", err)
-	}
-
-	err = w.Close()
-	if err != nil {
-		return nil, "", fmt.Errorf("closing writer: %w", err)
-	}
-
-	return buf, w.FormDataContentType(), nil
-}
-
-// send POST request to uriStr.
-func send(uriStr, cType string, buf *bytes.Buffer) (err error) {
-	var client http.Client
-
-	req, err := http.NewRequest(http.MethodPost, uriStr, buf)
-	if err != nil {
-		return fmt.Errorf("bad request: %w", err)
-	}
-
-	req.Header.Set(httphdr.ContentType, cType)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("client post form: %w", err)
-	}
-
-	defer func() {
-		err = errors.WithDeferred(err, resp.Body.Close())
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status code is not ok: %q", http.StatusText(resp.StatusCode))
 	}
 
 	return nil
@@ -545,10 +297,12 @@ func send(uriStr, cType string, buf *bytes.Buffer) (err error) {
 
 // autoAdd adds locales with additions to the git and restores locales with
 // deletions.
-func autoAdd(basePath string) (err error) {
+func autoAdd(ctx context.Context, l *slog.Logger, basePath string) (err error) {
 	defer func() { err = errors.Annotate(err, "auto add: %w") }()
 
-	adds, dels, err := changedLocales()
+	cmdCons := executil.SystemCommandConstructor{}
+
+	adds, dels, err := changedLocales(ctx, l, cmdCons)
 	if err != nil {
 		// Don't wrap the error since it's informative enough as is.
 		return err
@@ -558,28 +312,65 @@ func autoAdd(basePath string) (err error) {
 		return errors.Error("base locale contains deletions")
 	}
 
-	var (
-		args []string
-		code int
-		out  []byte
-	)
-
-	if len(adds) > 0 {
-		args = append([]string{"add"}, adds...)
-		code, out, err = aghos.RunCommand("git", args...)
-
-		if err != nil || code != 0 {
-			return fmt.Errorf("git add exited with code %d output %q: %w", code, out, err)
-		}
+	err = handleAdds(ctx, l, cmdCons, adds)
+	if err != nil {
+		// Don't wrap the error since it's informative enough as is.
+		return nil
 	}
 
-	if len(dels) > 0 {
-		args = append([]string{"restore"}, dels...)
-		code, out, err = aghos.RunCommand("git", args...)
+	err = handleDels(ctx, l, cmdCons, dels)
+	if err != nil {
+		// Don't wrap the error since it's informative enough as is.
+		return nil
+	}
 
-		if err != nil || code != 0 {
-			return fmt.Errorf("git restore exited with code %d output %q: %w", code, out, err)
-		}
+	return nil
+}
+
+// gitCmd is the shell command for Git.
+const gitCmd = "git"
+
+// handleAdds adds locales with additions to the git.
+func handleAdds(
+	ctx context.Context,
+	l *slog.Logger,
+	cmdCons executil.CommandConstructor,
+	locales []string,
+) (err error) {
+	if len(locales) == 0 {
+		return nil
+	}
+
+	gitArgs := append([]string{"add"}, locales...)
+	l.DebugContext(ctx, "executing", "cmd", gitCmd, "args", gitArgs)
+
+	code, out, err := aghos.RunCommand(ctx, cmdCons, gitCmd, gitArgs...)
+
+	if err != nil || code != 0 {
+		return fmt.Errorf("git add exited with code %d output %q: %w", code, out, err)
+	}
+
+	return nil
+}
+
+// handleDels restores locales with deletions.
+func handleDels(
+	ctx context.Context,
+	l *slog.Logger,
+	cmdCons executil.CommandConstructor,
+	locales []string,
+) (err error) {
+	if len(locales) == 0 {
+		return nil
+	}
+
+	gitArgs := append([]string{"restore"}, locales...)
+	l.DebugContext(ctx, "executing", "cmd", gitCmd, "args", gitArgs)
+
+	code, out, err := aghos.RunCommand(ctx, cmdCons, gitCmd, gitArgs...)
+
+	if err != nil || code != 0 {
+		return fmt.Errorf("git restore exited with code %d output %q: %w", code, out, err)
 	}
 
 	return nil
@@ -588,22 +379,32 @@ func autoAdd(basePath string) (err error) {
 // changedLocales returns cleaned paths of locales with changes or error.  adds
 // is the list of locales with only additions.  dels is the list of locales
 // with only deletions.
-func changedLocales() (adds, dels []string, err error) {
+func changedLocales(
+	ctx context.Context,
+	l *slog.Logger,
+	cmdCons executil.CommandConstructor,
+) (adds, dels []string, err error) {
 	defer func() { err = errors.Annotate(err, "getting changes: %w") }()
 
-	cmd := exec.Command("git", "diff", "--numstat", localesDir)
+	gitArgs := []string{"diff", "--numstat", localesDirHome}
+	l.DebugContext(ctx, "executing", "cmd", gitCmd, "args", gitArgs)
 
-	stdout, err := cmd.StdoutPipe()
+	// TODO(s.chzhen):  Consider streaming the output if needed.  Using
+	// [io.Pipe] here is unnecessary; it complicates lifecycle management
+	// because the output must be read concurrently, and the PipeWriter must be
+	// explicitly closed to signal EOF.  Since this command's output is small, a
+	// bytes.Buffer via executil.Run is sufficient.
+	var out bytes.Buffer
+	err = executil.Run(ctx, cmdCons, &executil.CommandConfig{
+		Path:   gitCmd,
+		Args:   gitArgs,
+		Stdout: &out,
+	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("piping: %w", err)
+		return nil, nil, fmt.Errorf("executing cmd: %w", err)
 	}
 
-	err = cmd.Start()
-	if err != nil {
-		return nil, nil, fmt.Errorf("starting: %w", err)
-	}
-
-	scanner := bufio.NewScanner(stdout)
+	scanner := bufio.NewScanner(&out)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -625,11 +426,6 @@ func changedLocales() (adds, dels []string, err error) {
 	err = scanner.Err()
 	if err != nil {
 		return nil, nil, fmt.Errorf("scanning: %w", err)
-	}
-
-	err = cmd.Wait()
-	if err != nil {
-		return nil, nil, fmt.Errorf("waiting: %w", err)
 	}
 
 	return adds, dels, nil

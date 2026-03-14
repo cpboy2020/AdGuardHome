@@ -7,18 +7,27 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
-	"net"
+	"log/slog"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering/rulelist"
 	"github.com/AdguardTeam/golibs/cache"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/urlfilter"
 	"github.com/AdguardTeam/urlfilter/filterlist"
 	"github.com/AdguardTeam/urlfilter/rules"
+	"github.com/c2h5oh/datasize"
 	"github.com/miekg/dns"
+)
+
+// Attribute keys and values for logging.
+const (
+	LogPrefix    = "safesearch"
+	LogKeyClient = "client"
 )
 
 // Service is a enum with service names used as search providers.
@@ -28,6 +37,7 @@ type Service string
 const (
 	Bing       Service = "bing"
 	DuckDuckGo Service = "duckduckgo"
+	Ecosia     Service = "ecosia"
 	Google     Service = "google"
 	Pixabay    Service = "pixabay"
 	Yandex     Service = "yandex"
@@ -41,6 +51,8 @@ func isServiceProtected(s filtering.SafeSearchConfig, service Service) (ok bool)
 		return s.Bing
 	case DuckDuckGo:
 		return s.DuckDuckGo
+	case Ecosia:
+		return s.Ecosia
 	case Google:
 		return s.Google
 	case Pixabay:
@@ -54,9 +66,32 @@ func isServiceProtected(s filtering.SafeSearchConfig, service Service) (ok bool)
 	}
 }
 
+// DefaultConfig is the configuration structure for [Default].
+type DefaultConfig struct {
+	// Logger is used for logging the operation of the safe search filter.
+	Logger *slog.Logger
+
+	// ClientName is the name of the persistent client associated with the safe
+	// search filter, if there is one.
+	ClientName string
+
+	// CacheSize is the size of the filter results cache.
+	CacheSize uint
+
+	// CacheTTL is the Time to Live duration for cached items.
+	CacheTTL time.Duration
+
+	// ServicesConfig contains safe search settings for services.  It must not
+	// be nil.
+	ServicesConfig filtering.SafeSearchConfig
+}
+
 // Default is the default safe search filter that uses filtering rules with the
 // dnsrewrite modifier.
 type Default struct {
+	// logger is used for logging the operation of the safe search filter.
+	logger *slog.Logger
+
 	// mu protects engine.
 	mu *sync.RWMutex
 
@@ -64,40 +99,28 @@ type Default struct {
 	// engine may be nil, which means that this safe search filter is disabled.
 	engine *urlfilter.DNSEngine
 
-	cache     cache.Cache
-	resolver  filtering.Resolver
-	logPrefix string
-	cacheTTL  time.Duration
+	// cache stores safe search filtering results.
+	cache cache.Cache
+
+	// cacheTTL is the Time to Live duration for cached items.
+	cacheTTL time.Duration
 }
 
-// NewDefault returns an initialized default safe search filter.  name is used
-// for logging.
-func NewDefault(
-	conf filtering.SafeSearchConfig,
-	name string,
-	cacheSize uint,
-	cacheTTL time.Duration,
-) (ss *Default, err error) {
-	var resolver filtering.Resolver = net.DefaultResolver
-	if conf.CustomResolver != nil {
-		resolver = conf.CustomResolver
-	}
-
+// NewDefault returns an initialized default safe search filter.  ctx is used
+// to log the initial refresh.
+func NewDefault(ctx context.Context, conf *DefaultConfig) (ss *Default, err error) {
 	ss = &Default{
-		mu: &sync.RWMutex{},
-
+		logger: conf.Logger,
+		mu:     &sync.RWMutex{},
 		cache: cache.New(cache.Config{
 			EnableLRU: true,
-			MaxSize:   cacheSize,
+			MaxSize:   conf.CacheSize,
 		}),
-		resolver: resolver,
-		// Use %s, because the client safe-search names already contain double
-		// quotes.
-		logPrefix: fmt.Sprintf("safesearch %s: ", name),
-		cacheTTL:  cacheTTL,
+		cacheTTL: conf.CacheTTL,
 	}
 
-	err = ss.resetEngine(filtering.SafeSearchListID, conf)
+	// TODO(s.chzhen):  Move to [Default.InitialRefresh].
+	err = ss.resetEngine(ctx, rulelist.IDSafeSearch, conf.ServicesConfig)
 	if err != nil {
 		// Don't wrap the error, because it's informative enough as is.
 		return nil, err
@@ -106,29 +129,15 @@ func NewDefault(
 	return ss, nil
 }
 
-// log is a helper for logging  that includes the name of the safe search
-// filter.  level must be one of [log.DEBUG], [log.INFO], and [log.ERROR].
-func (ss *Default) log(level log.Level, msg string, args ...any) {
-	switch level {
-	case log.DEBUG:
-		log.Debug(ss.logPrefix+msg, args...)
-	case log.INFO:
-		log.Info(ss.logPrefix+msg, args...)
-	case log.ERROR:
-		log.Error(ss.logPrefix+msg, args...)
-	default:
-		panic(fmt.Errorf("safesearch: unsupported logging level %d", level))
-	}
-}
-
 // resetEngine creates new engine for provided safe search configuration and
 // sets it in ss.
 func (ss *Default) resetEngine(
-	listID int,
+	ctx context.Context,
+	id rules.ListID,
 	conf filtering.SafeSearchConfig,
 ) (err error) {
 	if !conf.Enabled {
-		ss.log(log.INFO, "disabled")
+		ss.logger.DebugContext(ctx, "disabled")
 
 		return nil
 	}
@@ -140,20 +149,22 @@ func (ss *Default) resetEngine(
 		}
 	}
 
-	strList := &filterlist.StringRuleList{
-		ID:             listID,
-		RulesText:      sb.String(),
-		IgnoreCosmetic: true,
+	strList := []filterlist.Interface{
+		filterlist.NewString(&filterlist.StringConfig{
+			ID:             id,
+			RulesText:      sb.String(),
+			IgnoreCosmetic: true,
+		}),
 	}
 
-	rs, err := filterlist.NewRuleStorage([]filterlist.RuleList{strList})
+	rs, err := filterlist.NewRuleStorage(strList)
 	if err != nil {
 		return fmt.Errorf("creating rule storage: %w", err)
 	}
 
 	ss.engine = urlfilter.NewDNSEngine(rs)
 
-	ss.log(log.INFO, "reset %d rules", ss.engine.RulesCount)
+	ss.logger.InfoContext(ctx, "reset rules", "count", ss.engine.RulesCount)
 
 	return nil
 }
@@ -161,25 +172,28 @@ func (ss *Default) resetEngine(
 // type check
 var _ filtering.SafeSearch = (*Default)(nil)
 
-// CheckHost implements the [filtering.SafeSearch] interface for
-// *DefaultSafeSearch.
+// CheckHost implements the [filtering.SafeSearch] interface for *Default.
 func (ss *Default) CheckHost(
+	ctx context.Context,
 	host string,
 	qtype rules.RRType,
 ) (res filtering.Result, err error) {
 	start := time.Now()
 	defer func() {
-		ss.log(log.DEBUG, "lookup for %q finished in %s", host, time.Since(start))
+		ss.logger.DebugContext(ctx, "lookup finished", "host", host, "elapsed", time.Since(start))
 	}()
 
-	if qtype != dns.TypeA && qtype != dns.TypeAAAA {
-		return filtering.Result{}, fmt.Errorf("unsupported question type %s", dns.Type(qtype))
+	switch qtype {
+	case dns.TypeA, dns.TypeAAAA, dns.TypeHTTPS:
+		// Go on.
+	default:
+		return filtering.Result{}, nil
 	}
 
 	// Check cache. Return cached result if it was found
-	cachedValue, isFound := ss.getCachedResult(host, qtype)
+	cachedValue, isFound := ss.getCachedResult(ctx, host, qtype)
 	if isFound {
-		ss.log(log.DEBUG, "found in cache: %q", host)
+		ss.logger.DebugContext(ctx, "found in cache", "host", host)
 
 		return cachedValue, nil
 	}
@@ -191,19 +205,18 @@ func (ss *Default) CheckHost(
 
 	fltRes, err := ss.newResult(rewrite, qtype)
 	if err != nil {
-		ss.log(log.DEBUG, "looking up addresses for %q: %s", host, err)
+		ss.logger.ErrorContext(ctx, "looking up addresses", "host", host, slogutil.KeyError, err)
 
 		return filtering.Result{}, err
 	}
 
-	if fltRes != nil {
-		res = *fltRes
-		ss.setCacheResult(host, qtype, res)
+	res = *fltRes
 
-		return res, nil
-	}
+	// TODO(a.garipov): Consider switch back to resolving CNAME records IPs and
+	// saving results to cache.
+	ss.setCacheResult(ctx, host, qtype, res)
 
-	return filtering.Result{}, fmt.Errorf("no ipv4 addresses for %q", host)
+	return res, nil
 }
 
 // searchHost looks up DNS rewrites in the internal DNS filtering engine.
@@ -229,91 +242,48 @@ func (ss *Default) searchHost(host string, qtype rules.RRType) (res *rules.DNSRe
 }
 
 // newResult creates Result object from rewrite rule.  qtype must be either
-// [dns.TypeA] or [dns.TypeAAAA].
+// [dns.TypeA] or [dns.TypeAAAA], or [dns.TypeHTTPS].  If err is nil, res is
+// never nil, so that the empty result is converted into a NODATA response.
 func (ss *Default) newResult(
 	rewrite *rules.DNSRewrite,
 	qtype rules.RRType,
 ) (res *filtering.Result, err error) {
 	res = &filtering.Result{
-		Rules: []*filtering.ResultRule{{
-			FilterListID: filtering.SafeSearchListID,
-		}},
 		Reason:     filtering.FilteredSafeSearch,
 		IsFiltered: true,
 	}
 
 	if rewrite.RRType == qtype {
-		ip, ok := rewrite.Value.(net.IP)
-		if !ok || ip == nil {
-			return nil, nil
+		ip, ok := rewrite.Value.(netip.Addr)
+		if !ok || ip == (netip.Addr{}) {
+			return nil, fmt.Errorf("expected ip rewrite value, got %T(%[1]v)", rewrite.Value)
 		}
 
-		res.Rules[0].IP = ip
+		res.Rules = []*filtering.ResultRule{{
+			FilterListID: rulelist.APIIDSafeSearch,
+			IP:           ip,
+		}}
 
 		return res, nil
 	}
 
-	host := rewrite.NewCNAME
-	if host == "" {
-		return nil, nil
-	}
+	res.CanonName = rewrite.NewCNAME
 
-	ss.log(log.DEBUG, "resolving %q", host)
-
-	ips, err := ss.resolver.LookupIP(context.Background(), qtypeToProto(qtype), host)
-	if err != nil {
-		return nil, err
-	}
-
-	ss.log(log.DEBUG, "resolved %s", ips)
-
-	for _, ip := range ips {
-		// TODO(a.garipov): Remove this filtering once the resolver we use
-		// actually learns about network.
-		ip = fitToProto(ip, qtype)
-		if ip == nil {
-			continue
-		}
-
-		res.Rules[0].IP = ip
-
-		return res, nil
-	}
-
-	return nil, nil
-}
-
-// qtypeToProto returns "ip4" for [dns.TypeA] and "ip6" for [dns.TypeAAAA].
-// It panics for other types.
-func qtypeToProto(qtype rules.RRType) (proto string) {
-	switch qtype {
-	case dns.TypeA:
-		return "ip4"
-	case dns.TypeAAAA:
-		return "ip6"
-	default:
-		panic(fmt.Errorf("safesearch: unsupported question type %s", dns.Type(qtype)))
-	}
-}
-
-// fitToProto returns a non-nil IP address if ip is the correct protocol version
-// for qtype.  qtype is expected to be either [dns.TypeA] or [dns.TypeAAAA].
-func fitToProto(ip net.IP, qtype rules.RRType) (res net.IP) {
-	ip4 := ip.To4()
-	if qtype == dns.TypeA {
-		return ip4
-	}
-
-	if ip4 == nil {
-		return ip
-	}
-
-	return nil
+	return res, nil
 }
 
 // setCacheResult stores data in cache for host.  qtype is expected to be either
 // [dns.TypeA] or [dns.TypeAAAA].
-func (ss *Default) setCacheResult(host string, qtype rules.RRType, res filtering.Result) {
+//
+// TODO(a.garipov):  Remove gob and use uint64.
+func (ss *Default) setCacheResult(
+	ctx context.Context,
+	host string,
+	qtype rules.RRType,
+	res filtering.Result,
+) {
+	// #nosec G115 -- The Unix epoch time is highly unlikely to be negative, and
+	// also see the TODO.
 	expire := uint32(time.Now().Add(ss.cacheTTL).Unix())
 	exp := make([]byte, 4)
 	binary.BigEndian.PutUint32(exp, expire)
@@ -321,7 +291,7 @@ func (ss *Default) setCacheResult(host string, qtype rules.RRType, res filtering
 
 	err := gob.NewEncoder(buf).Encode(res)
 	if err != nil {
-		ss.log(log.ERROR, "cache encoding: %s", err)
+		ss.logger.ErrorContext(ctx, "cache encoding", slogutil.KeyError, err)
 
 		return
 	}
@@ -329,12 +299,20 @@ func (ss *Default) setCacheResult(host string, qtype rules.RRType, res filtering
 	val := buf.Bytes()
 	_ = ss.cache.Set([]byte(dns.Type(qtype).String()+" "+host), val)
 
-	ss.log(log.DEBUG, "stored in cache: %q, %d bytes", host, len(val))
+	ss.logger.DebugContext(
+		ctx,
+		"stored in cache",
+		"host", host,
+		"entry_size", datasize.ByteSize(len(val)),
+	)
 }
 
 // getCachedResult returns stored data from cache for host.  qtype is expected
 // to be either [dns.TypeA] or [dns.TypeAAAA].
+//
+// TODO(a.garipov):  Remove gob and use uint64.
 func (ss *Default) getCachedResult(
+	ctx context.Context,
 	host string,
 	qtype rules.RRType,
 ) (res filtering.Result, ok bool) {
@@ -346,6 +324,8 @@ func (ss *Default) getCachedResult(
 	}
 
 	exp := binary.BigEndian.Uint32(data[:4])
+	// #nosec G115 -- The Unix epoch time is highly unlikely to be negative, and
+	// also see the TODO.
 	if exp <= uint32(time.Now().Unix()) {
 		ss.cache.Del([]byte(host))
 
@@ -356,7 +336,7 @@ func (ss *Default) getCachedResult(
 
 	err := gob.NewDecoder(buf).Decode(&res)
 	if err != nil {
-		ss.log(log.ERROR, "cache decoding: %s", err)
+		ss.logger.ErrorContext(ctx, "cache decoding", slogutil.KeyError, err)
 
 		return filtering.Result{}, false
 	}
@@ -366,11 +346,11 @@ func (ss *Default) getCachedResult(
 
 // Update implements the [filtering.SafeSearch] interface for *Default.  Update
 // ignores the CustomResolver and Enabled fields.
-func (ss *Default) Update(conf filtering.SafeSearchConfig) (err error) {
+func (ss *Default) Update(ctx context.Context, conf filtering.SafeSearchConfig) (err error) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
-	err = ss.resetEngine(filtering.SafeSearchListID, conf)
+	err = ss.resetEngine(ctx, rulelist.IDSafeSearch, conf)
 	if err != nil {
 		// Don't wrap the error, because it's informative enough as is.
 		return err

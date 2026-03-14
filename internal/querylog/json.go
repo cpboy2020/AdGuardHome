@@ -1,15 +1,17 @@
 package querylog
 
 import (
+	"context"
+	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/miekg/dns"
-	"golang.org/x/exp/slices"
 	"golang.org/x/net/idna"
 )
 
@@ -19,7 +21,8 @@ import (
 type jobject = map[string]any
 
 // entriesToJSON converts query log entries to JSON.
-func entriesToJSON(
+func (l *queryLog) entriesToJSON(
+	ctx context.Context,
 	entries []*logEntry,
 	oldest time.Time,
 	anonFunc aghnet.IPMutFunc,
@@ -28,7 +31,7 @@ func entriesToJSON(
 
 	// The elements order is already reversed to be from newer to older.
 	for _, entry := range entries {
-		jsonEntry := entryToJSON(entry, anonFunc)
+		jsonEntry := l.entryToJSON(ctx, entry, anonFunc)
 		data = append(data, jsonEntry)
 	}
 
@@ -44,20 +47,12 @@ func entriesToJSON(
 }
 
 // entryToJSON converts a log entry's data into an entry for the JSON API.
-func entryToJSON(entry *logEntry, anonFunc aghnet.IPMutFunc) (jsonEntry jobject) {
-	hostname := entry.QHost
-	question := jobject{
-		"type":  entry.QType,
-		"class": entry.QClass,
-		"name":  hostname,
-	}
-
-	if qhost, err := idna.ToUnicode(hostname); err != nil {
-		log.Debug("querylog: translating %q into unicode: %s", hostname, err)
-	} else if qhost != hostname && qhost != "" {
-		question["unicode_name"] = qhost
-	}
-
+func (l *queryLog) entryToJSON(
+	ctx context.Context,
+	entry *logEntry,
+	anonFunc aghnet.IPMutFunc,
+) (jsonEntry jobject) {
+	question := questionPayload(ctx, l.logger, entry)
 	entIP := slices.Clone(entry.IP)
 	anonFunc(entIP)
 
@@ -96,21 +91,50 @@ func entryToJSON(entry *logEntry, anonFunc aghnet.IPMutFunc) (jsonEntry jobject)
 		jsonEntry["service_name"] = entry.Result.ServiceName
 	}
 
-	setMsgData(entry, jsonEntry)
-	setOrigAns(entry, jsonEntry)
+	l.setMsgData(ctx, entry, jsonEntry)
+	l.setOrigAns(ctx, entry, jsonEntry)
 
 	return jsonEntry
 }
 
+// questionPayload builds the "question" field for a logEntry.  l and entry must
+// not be nil.
+func questionPayload(ctx context.Context, l *slog.Logger, entry *logEntry) (q jobject) {
+	hostname := entry.QHost
+	q = jobject{
+		"type":  entry.QType,
+		"class": entry.QClass,
+		"name":  hostname,
+	}
+
+	if qhost, err := idna.ToUnicode(hostname); err != nil {
+		l.DebugContext(
+			ctx,
+			"translating into unicode",
+			"hostname", hostname,
+			slogutil.KeyError, err,
+		)
+	} else if qhost != hostname && qhost != "" {
+		q["unicode_name"] = qhost
+	}
+
+	return q
+}
+
 // setMsgData sets the message data in jsonEntry.
-func setMsgData(entry *logEntry, jsonEntry jobject) {
+func (l *queryLog) setMsgData(ctx context.Context, entry *logEntry, jsonEntry jobject) {
 	if len(entry.Answer) == 0 {
 		return
 	}
 
 	msg := &dns.Msg{}
 	if err := msg.Unpack(entry.Answer); err != nil {
-		log.Debug("querylog: failed to unpack dns msg answer: %v: %s", entry.Answer, err)
+		l.logger.DebugContext(
+			ctx,
+			"unpacking dns message",
+			"answer", entry.Answer,
+			slogutil.KeyError, err,
+		)
 
 		return
 	}
@@ -126,7 +150,7 @@ func setMsgData(entry *logEntry, jsonEntry jobject) {
 }
 
 // setOrigAns sets the original answer data in jsonEntry.
-func setOrigAns(entry *logEntry, jsonEntry jobject) {
+func (l *queryLog) setOrigAns(ctx context.Context, entry *logEntry, jsonEntry jobject) {
 	if len(entry.OrigAnswer) == 0 {
 		return
 	}
@@ -134,7 +158,12 @@ func setOrigAns(entry *logEntry, jsonEntry jobject) {
 	orig := &dns.Msg{}
 	err := orig.Unpack(entry.OrigAnswer)
 	if err != nil {
-		log.Debug("querylog: orig.Unpack(entry.OrigAnswer): %v: %s", entry.OrigAnswer, err)
+		l.logger.DebugContext(
+			ctx,
+			"setting original answer",
+			"answer", entry.OrigAnswer,
+			slogutil.KeyError, err,
+		)
 
 		return
 	}

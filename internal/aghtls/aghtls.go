@@ -2,25 +2,29 @@
 package aghtls
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"net/netip"
+	"log/slog"
+	"slices"
 
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/netutil"
 )
 
-// init makes sure that the cipher name map is filled.
+// Init populates the cipherSuites map with the name-to-ID mapping of cipher
+// suites from crypto/tls.  It must be called only once, and it must be called
+// before any function that calls [ParseCiphers].
 //
 // TODO(a.garipov): Propose a similar API to crypto/tls.
-func init() {
+func Init(ctx context.Context, l *slog.Logger) {
 	suites := tls.CipherSuites()
 	cipherSuites = make(map[string]uint16, len(suites))
 	for _, s := range suites {
 		cipherSuites[s.Name] = s.ID
 	}
 
-	log.Debug("tls: known ciphers: %q", cipherSuites)
+	l.DebugContext(ctx, "known ciphers", "ciphers", cipherSuites)
 }
 
 // cipherSuites are a name-to-ID mapping of cipher suites from crypto/tls.  It
@@ -75,15 +79,5 @@ func SaferCipherSuites() (safe []uint16) {
 // CertificateHasIP returns true if cert has at least a single IP address among
 // its subjectAltNames.
 func CertificateHasIP(cert *x509.Certificate) (ok bool) {
-	if len(cert.IPAddresses) > 0 {
-		return true
-	}
-
-	for _, name := range cert.DNSNames {
-		if _, err := netip.ParseAddr(name); err == nil {
-			return true
-		}
-	}
-
-	return false
+	return len(cert.IPAddresses) > 0 || slices.ContainsFunc(cert.DNSNames, netutil.IsValidIPString)
 }

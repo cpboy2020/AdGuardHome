@@ -2,109 +2,56 @@ package aghtest
 
 import (
 	"context"
-	"io/fs"
-	"net"
+	"net/http"
+	"net/netip"
+	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/agh"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
-	"github.com/AdguardTeam/AdGuardHome/internal/next/agh"
+	nextagh "github.com/AdguardTeam/AdGuardHome/internal/next/agh"
+	"github.com/AdguardTeam/AdGuardHome/internal/rdns"
+	"github.com/AdguardTeam/AdGuardHome/internal/whois"
 	"github.com/AdguardTeam/dnsproxy/upstream"
+	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/miekg/dns"
 )
 
-// Interface Mocks
-//
-// Keep entities in this file in alphabetic order.
-
-// Standard Library
-
-// Package fs
-
-// type check
-var _ fs.FS = &FS{}
-
-// FS is a mock [fs.FS] implementation for tests.
-type FS struct {
-	OnOpen func(name string) (fs.File, error)
+// FSWatcher is a fake [aghos.FSWatcher] implementation for tests.
+type FSWatcher struct {
+	OnStart    func(ctx context.Context) (err error)
+	OnShutdown func(ctx context.Context) (err error)
+	OnEvents   func() (e <-chan aghos.Event)
+	OnAdd      func(name string) (err error)
+	OnRemove   func(name string) (err error)
 }
 
-// Open implements the [fs.FS] interface for *FS.
-func (fsys *FS) Open(name string) (fs.File, error) {
-	return fsys.OnOpen(name)
+// NewFSWatcher returns a new *FSWatcher all methods of which panic.
+func NewFSWatcher() (w *FSWatcher) {
+	return &FSWatcher{
+		OnStart:    func(ctx context.Context) (_ error) { panic(testutil.UnexpectedCall(ctx)) },
+		OnShutdown: func(ctx context.Context) (_ error) { panic(testutil.UnexpectedCall(ctx)) },
+		OnEvents:   func() (_ <-chan aghos.Event) { panic(testutil.UnexpectedCall()) },
+		OnAdd:      func(name string) (_ error) { panic(testutil.UnexpectedCall(name)) },
+		OnRemove:   func(name string) (_ error) { panic(testutil.UnexpectedCall(name)) },
+	}
 }
-
-// type check
-var _ fs.GlobFS = &GlobFS{}
-
-// GlobFS is a mock [fs.GlobFS] implementation for tests.
-type GlobFS struct {
-	// FS is embedded here to avoid implementing all it's methods.
-	FS
-	OnGlob func(pattern string) ([]string, error)
-}
-
-// Glob implements the [fs.GlobFS] interface for *GlobFS.
-func (fsys *GlobFS) Glob(pattern string) ([]string, error) {
-	return fsys.OnGlob(pattern)
-}
-
-// type check
-var _ fs.StatFS = &StatFS{}
-
-// StatFS is a mock [fs.StatFS] implementation for tests.
-type StatFS struct {
-	// FS is embedded here to avoid implementing all it's methods.
-	FS
-	OnStat func(name string) (fs.FileInfo, error)
-}
-
-// Stat implements the [fs.StatFS] interface for *StatFS.
-func (fsys *StatFS) Stat(name string) (fs.FileInfo, error) {
-	return fsys.OnStat(name)
-}
-
-// Package net
-
-// type check
-var _ net.Listener = (*Listener)(nil)
-
-// Listener is a mock [net.Listener] implementation for tests.
-type Listener struct {
-	OnAccept func() (conn net.Conn, err error)
-	OnAddr   func() (addr net.Addr)
-	OnClose  func() (err error)
-}
-
-// Accept implements the [net.Listener] interface for *Listener.
-func (l *Listener) Accept() (conn net.Conn, err error) {
-	return l.OnAccept()
-}
-
-// Addr implements the [net.Listener] interface for *Listener.
-func (l *Listener) Addr() (addr net.Addr) {
-	return l.OnAddr()
-}
-
-// Close implements the [net.Listener] interface for *Listener.
-func (l *Listener) Close() (err error) {
-	return l.OnClose()
-}
-
-// Module adguard-home
-
-// Package aghos
 
 // type check
 var _ aghos.FSWatcher = (*FSWatcher)(nil)
 
-// FSWatcher is a mock [aghos.FSWatcher] implementation for tests.
-type FSWatcher struct {
-	OnEvents func() (e <-chan struct{})
-	OnAdd    func(name string) (err error)
-	OnClose  func() (err error)
+// Start implements the [aghos.FSWatcher] interface for *FSWatcher.
+func (w *FSWatcher) Start(ctx context.Context) (err error) {
+	return w.OnStart(ctx)
+}
+
+// Shutdown implements the [aghos.FSWatcher] interface for *FSWatcher.
+func (w *FSWatcher) Shutdown(ctx context.Context) (err error) {
+	return w.OnShutdown(ctx)
 }
 
 // Events implements the [aghos.FSWatcher] interface for *FSWatcher.
-func (w *FSWatcher) Events() (e <-chan struct{}) {
+func (w *FSWatcher) Events() (e <-chan aghos.Event) {
 	return w.OnEvents()
 }
 
@@ -113,49 +60,92 @@ func (w *FSWatcher) Add(name string) (err error) {
 	return w.OnAdd(name)
 }
 
-// Close implements the [aghos.FSWatcher] interface for *FSWatcher.
-func (w *FSWatcher) Close() (err error) {
-	return w.OnClose()
+// Remove implements the [aghos.FSWatcher] interface for *FSWatcher.
+func (w *FSWatcher) Remove(name string) (err error) {
+	return w.OnRemove(name)
 }
 
-// Package agh
-
-// type check
-var _ agh.ServiceWithConfig[struct{}] = (*ServiceWithConfig[struct{}])(nil)
-
-// ServiceWithConfig is a mock [agh.ServiceWithConfig] implementation for tests.
+// ServiceWithConfig is a fake [nextagh.ServiceWithConfig] implementation for
+// tests.
 type ServiceWithConfig[ConfigType any] struct {
-	OnStart    func() (err error)
+	OnStart    func(ctx context.Context) (err error)
 	OnShutdown func(ctx context.Context) (err error)
 	OnConfig   func() (c ConfigType)
 }
 
-// Start implements the [agh.ServiceWithConfig] interface for
+// type check
+var _ nextagh.ServiceWithConfig[struct{}] = (*ServiceWithConfig[struct{}])(nil)
+
+// Start implements the [nextagh.ServiceWithConfig] interface for
 // *ServiceWithConfig.
-func (s *ServiceWithConfig[_]) Start() (err error) {
-	return s.OnStart()
+func (s *ServiceWithConfig[_]) Start(ctx context.Context) (err error) {
+	return s.OnStart(ctx)
 }
 
-// Shutdown implements the [agh.ServiceWithConfig] interface for
+// Shutdown implements the [nextagh.ServiceWithConfig] interface for
 // *ServiceWithConfig.
 func (s *ServiceWithConfig[_]) Shutdown(ctx context.Context) (err error) {
 	return s.OnShutdown(ctx)
 }
 
-// Config implements the [agh.ServiceWithConfig] interface for
+// Config implements the [nextagh.ServiceWithConfig] interface for
 // *ServiceWithConfig.
 func (s *ServiceWithConfig[ConfigType]) Config() (c ConfigType) {
 	return s.OnConfig()
 }
 
-// Module dnsproxy
+// AddressProcessor is a fake [client.AddressProcessor] implementation for
+// tests.
+type AddressProcessor struct {
+	OnProcess func(ctx context.Context, ip netip.Addr)
+	OnClose   func() (err error)
+}
 
-// Package upstream
+// Process implements the [client.AddressProcessor] interface for
+// *AddressProcessor.
+func (p *AddressProcessor) Process(ctx context.Context, ip netip.Addr) {
+	p.OnProcess(ctx, ip)
+}
+
+// Close implements the [client.AddressProcessor] interface for
+// *AddressProcessor.
+func (p *AddressProcessor) Close() (err error) {
+	return p.OnClose()
+}
+
+// AddressUpdater is a fake [client.AddressUpdater] implementation for tests.
+type AddressUpdater struct {
+	OnUpdateAddress func(ctx context.Context, ip netip.Addr, host string, info *whois.Info)
+}
+
+// UpdateAddress implements the [client.AddressUpdater] interface for
+// *AddressUpdater.
+func (p *AddressUpdater) UpdateAddress(
+	ctx context.Context,
+	ip netip.Addr,
+	host string,
+	info *whois.Info,
+) {
+	p.OnUpdateAddress(ctx, ip, host, info)
+}
+
+// Exchanger is a fake [rdns.Exchanger] implementation for tests.
+type Exchanger struct {
+	OnExchange func(ctx context.Context, ip netip.Addr) (host string, ttl time.Duration, err error)
+}
 
 // type check
-var _ upstream.Upstream = (*UpstreamMock)(nil)
+var _ rdns.Exchanger = (*Exchanger)(nil)
 
-// UpstreamMock is a mock [upstream.Upstream] implementation for tests.
+// Exchange implements [rdns.Exchanger] interface for *Exchanger.
+func (e *Exchanger) Exchange(
+	ctx context.Context,
+	ip netip.Addr,
+) (host string, ttl time.Duration, err error) {
+	return e.OnExchange(ctx, ip)
+}
+
+// UpstreamMock is a fake [upstream.Upstream] implementation for tests.
 //
 // TODO(a.garipov): Replace with all uses of Upstream with UpstreamMock and
 // rename it to just Upstream.
@@ -164,6 +154,9 @@ type UpstreamMock struct {
 	OnExchange func(req *dns.Msg) (resp *dns.Msg, err error)
 	OnClose    func() (err error)
 }
+
+// type check
+var _ upstream.Upstream = (*UpstreamMock)(nil)
 
 // Address implements the [upstream.Upstream] interface for *UpstreamMock.
 func (u *UpstreamMock) Address() (addr string) {
@@ -178,4 +171,30 @@ func (u *UpstreamMock) Exchange(req *dns.Msg) (resp *dns.Msg, err error) {
 // Close implements the [upstream.Upstream] interface for *UpstreamMock.
 func (u *UpstreamMock) Close() (err error) {
 	return u.OnClose()
+}
+
+// ConfigModifier is a fake [agh.ConfigModifier] implementation for tests.
+type ConfigModifier struct {
+	OnApply func(ctx context.Context)
+}
+
+// type check
+var _ agh.ConfigModifier = (*ConfigModifier)(nil)
+
+// Apply implements the [agh.ConfigModifier] interface for *ConfigModifier.
+func (m *ConfigModifier) Apply(ctx context.Context) {
+	m.OnApply(ctx)
+}
+
+// Registrar is a fake [aghhttp.Registrar] implementation for tests.
+type Registrar struct {
+	OnRegister func(method, path string, h http.HandlerFunc)
+}
+
+// type check
+var _ aghhttp.Registrar = (*Registrar)(nil)
+
+// Register implements the [aghhttp.Registrar] interface for *Registrar.
+func (m *Registrar) Register(method, path string, h http.HandlerFunc) {
+	m.OnRegister(method, path, h)
 }

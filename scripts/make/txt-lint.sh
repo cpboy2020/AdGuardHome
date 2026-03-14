@@ -1,21 +1,19 @@
 #!/bin/sh
 
 # This comment is used to simplify checking local copies of the script.  Bump
-# this number every time a remarkable change is made to this script.
+# this number every time a significant change is made to this script.
 #
-# AdGuard-Project-Version: 3
+# AdGuard-Project-Version: 12
 
 verbose="${VERBOSE:-0}"
 readonly verbose
 
-if [ "$verbose" -gt '0' ]
-then
+if [ "$verbose" -gt '0' ]; then
 	set -x
 fi
 
 # Set $EXIT_ON_ERROR to zero to see all errors.
-if [ "${EXIT_ON_ERROR:-1}" -eq '0' ]
-then
+if [ "${EXIT_ON_ERROR:-1}" -eq '0' ]; then
 	set +e
 else
 	set -e
@@ -31,26 +29,102 @@ set -f -u
 
 # trailing_newlines is a simple check that makes sure that all plain-text files
 # have a trailing newlines to make sure that all tools work correctly with them.
-trailing_newlines() {
-	nl="$( printf "\n" )"
+trailing_newlines() (
+	nl="$(printf '\n')"
 	readonly nl
 
-	# NOTE: Adjust for your project.
-	git ls-files\
-		':!*.png'\
-		':!*.tar.gz'\
-		':!*.zip'\
-		| while read -r f
-		do
-			if [ "$( tail -c -1 "$f" )" != "$nl" ]
-			then
+	find_with_ignore \
+		-type 'f' \
+		'!' '(' \
+		-name '*.db' \
+		-o -name '*.exe' \
+		-o -name '*.out' \
+		-o -name '*.png' \
+		-o -name '*.svg' \
+		-o -name '*.tar.gz' \
+		-o -name '*.test' \
+		-o -name '*.zip' \
+		-o -name 'AdGuardHome' \
+		-o -name 'adguard-home' \
+		')' \
+		-print \
+		| while read -r f; do
+			final_byte="$(tail -c -1 "$f")"
+			if [ "$final_byte" != "$nl" ]; then
 				printf '%s: must have a trailing newline\n' "$f"
+			fi
+		done
+)
+
+# trailing_whitespace is a simple check that makes sure that there are no
+# trailing whitespace in plain-text files.
+trailing_whitespace() {
+	find_with_ignore \
+		-type 'f' \
+		'!' '(' \
+		-name '*.db' \
+		-o -name '*.exe' \
+		-o -name '*.out' \
+		-o -name '*.png' \
+		-o -name '*.svg' \
+		-o -name '*.tar.gz' \
+		-o -name '*.test' \
+		-o -name '*.zip' \
+		-o -name 'AdGuardHome' \
+		-o -name 'adguard-home' \
+		')' \
+		-print \
+		| while read -r f; do
+			grep -e '[[:space:]]$' -n -- "$f" \
+				| sed -e "s:^:${f}\::" -e 's/ \+$/>>>&<<</'
+		done
+}
+
+# valid_json check ensures that all the .json files in the project are valid and
+# well-formatted according to the jq.
+#
+# TODO(e.burkov):  Include tsconfig.json when it stop containing comments.
+valid_json() {
+	find_with_ignore \
+		-type 'f' \
+		-name '*.json' \
+		'!' '(' \
+		-name 'tsconfig.json' \
+		')' \
+		-print \
+		| while read -r f; do
+			validation_msg="$(jq empty "$f" 2>&1)"
+			exitcode="$?"
+
+			if [ "$exitcode" -ne '0' ]; then
+				printf 'file %s: %s\n' "$f" "$validation_msg"
+
+				continue
+			fi
+
+			if ! jq . "$f" | diff -u "$f" - >/dev/null 2>&1; then
+				printf 'file %s has formatting issues\n' "$f"
 			fi
 		done
 }
 
 run_linter -e trailing_newlines
 
-git ls-files -- '*.md' '*.txt' '*.yaml' '*.yml' 'client/src/__locales/en.json'\
-	| xargs misspell --error\
-	| sed -e 's/^/misspell: /'
+run_linter -e trailing_whitespace
+
+run_linter -e valid_json
+
+go="${GO:-go}"
+readonly go
+
+find_with_ignore \
+	-type 'f' \
+	'(' \
+	-name 'Makefile' \
+	-o -name '*.conf' \
+	-o -name '*.md' \
+	-o -name '*.txt' \
+	-o -name '*.yaml' \
+	-o -name '*.yml' \
+	')' \
+	-exec "$go" 'tool' 'misspell' '--error' '{}' '+'
